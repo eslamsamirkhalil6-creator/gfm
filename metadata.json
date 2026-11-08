@@ -1,0 +1,6 @@
+{
+  "name": "GFMS Technical Foundation Prototype v0.1",
+  "description": "Garment Factory Management System (GFMS) Technical Foundation Prototype with PostgreSQL, Express REST API, React TypeScript frontend, RBAC, and Audit Logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
