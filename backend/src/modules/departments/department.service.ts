@@ -10,6 +10,7 @@ import {
   CreateDepartmentDTO,
   UpdateDepartmentDTO,
   AssignEmployeeDTO,
+  DepartmentProductionLineSummary,
 } from './department.types.ts';
 
 export class DepartmentService {
@@ -44,13 +45,17 @@ export class DepartmentService {
   }
 
   /**
-   * List all departments with details (manager, parent, sub-department count, employee count)
+   * List all departments with details (manager, parent, sub-department count, employee count, production lines)
    */
-  static async listDepartments(filter?: {
-    status?: string;
-    parent_id?: number | null;
-    search?: string;
-  }): Promise<DepartmentWithDetails[]> {
+  static async listDepartments(
+    filter?: {
+      status?: string;
+      parent_id?: number | null;
+      search?: string;
+    },
+    actorUserId?: number,
+    isGlobalViewer: boolean = true
+  ): Promise<DepartmentWithDetails[]> {
     let sql = `
       SELECT 
         d.id,
@@ -75,6 +80,12 @@ export class DepartmentService {
     const params: any[] = [];
     let paramIndex = 1;
 
+    // Scoped filtering: if not a global viewer, only return departments managed by this user
+    if (!isGlobalViewer && actorUserId !== undefined) {
+      sql += ` AND d.manager_id = $${paramIndex++}`;
+      params.push(actorUserId);
+    }
+
     if (filter?.status) {
       sql += ` AND d.status = $${paramIndex++}`;
       params.push(filter.status);
@@ -97,13 +108,16 @@ export class DepartmentService {
 
     sql += ` ORDER BY d.parent_id NULLS FIRST, d.name ASC`;
 
-    const [deptRes, subCountsRes, empCountsRes] = await Promise.all([
+    const [deptRes, subCountsRes, empCountsRes, lineCountsRes] = await Promise.all([
       query(sql, params),
       query<{ parent_id: number; cnt: string }>(
         'SELECT parent_id, count(*) as cnt FROM departments WHERE parent_id IS NOT NULL GROUP BY parent_id'
       ),
       query<{ department_id: number; cnt: string }>(
         'SELECT department_id, count(*) as cnt FROM department_employees GROUP BY department_id'
+      ),
+      query<{ department_id: number; cnt: string }>(
+        'SELECT department_id, count(*) as cnt FROM production_lines WHERE department_id IS NOT NULL GROUP BY department_id'
       ),
     ]);
 
@@ -117,10 +131,16 @@ export class DepartmentService {
       empCountsMap.set(r.department_id, parseInt(r.cnt || '0', 10));
     }
 
+    const lineCountsMap = new Map<number, number>();
+    for (const r of lineCountsRes.rows) {
+      lineCountsMap.set(r.department_id, parseInt(r.cnt || '0', 10));
+    }
+
     return deptRes.rows.map(row => ({
       ...row,
       sub_department_count: subCountsMap.get(row.id) || 0,
       employee_count: empCountsMap.get(row.id) || 0,
+      production_lines_count: lineCountsMap.get(row.id) || 0,
     }));
   }
 
@@ -157,6 +177,7 @@ export class DepartmentService {
     sub_departments: DepartmentWithDetails[];
     employees: DepartmentEmployee[];
     manager_history: DepartmentManagerHistoryItem[];
+    production_lines?: DepartmentProductionLineSummary[];
   }> {
     const list = await this.listDepartments();
     const dept = list.find(d => d.id === id);
@@ -211,12 +232,90 @@ export class DepartmentService {
       [id]
     );
 
+    // Fetch department-linked production lines
+    const linesRes = await query<{
+      id: number;
+      line_number: string;
+      name: string;
+      hall_id: number;
+      hall_name: string | null;
+      production_type: string;
+      supervisor_id: number | null;
+      supervisor_name: string | null;
+      capacity_per_day: number;
+      status: string;
+      description: string | null;
+    }>(
+      `
+      SELECT 
+        l.id,
+        l.line_number,
+        l.name,
+        l.hall_id,
+        h.name as hall_name,
+        l.production_type,
+        l.supervisor_id,
+        u.full_name as supervisor_name,
+        l.capacity_per_day,
+        l.status,
+        l.description
+      FROM production_lines l
+      LEFT JOIN production_halls h ON l.hall_id = h.id
+      LEFT JOIN users u ON l.supervisor_id = u.id
+      WHERE l.department_id = $1
+      ORDER BY l.id ASC
+      `,
+      [id]
+    );
+
     return {
       department: dept,
       sub_departments: subDepartments,
       employees: empRes.rows,
       manager_history: historyRes.rows,
+      production_lines: linesRes.rows,
     };
+  }
+
+  /**
+   * Get production lines linked to a department
+   */
+  static async getDepartmentLines(deptId: number) {
+    const res = await query<{
+      id: number;
+      line_number: string;
+      name: string;
+      hall_id: number;
+      hall_name: string | null;
+      production_type: string;
+      supervisor_id: number | null;
+      supervisor_name: string | null;
+      capacity_per_day: number;
+      status: string;
+      description: string | null;
+    }>(
+      `
+      SELECT 
+        l.id,
+        l.line_number,
+        l.name,
+        l.hall_id,
+        h.name as hall_name,
+        l.production_type,
+        l.supervisor_id,
+        u.full_name as supervisor_name,
+        l.capacity_per_day,
+        l.status,
+        l.description
+      FROM production_lines l
+      LEFT JOIN production_halls h ON l.hall_id = h.id
+      LEFT JOIN users u ON l.supervisor_id = u.id
+      WHERE l.department_id = $1
+      ORDER BY l.id ASC
+      `,
+      [deptId]
+    );
+    return res.rows;
   }
 
   /**
@@ -345,16 +444,31 @@ export class DepartmentService {
     id: number,
     dto: UpdateDepartmentDTO,
     actorId: number,
-    ipAddress?: string
+    ipAddress?: string,
+    actorPermissions: string[] = []
   ): Promise<DepartmentWithDetails> {
+    if (Array.isArray(ipAddress)) {
+      actorPermissions = ipAddress as string[];
+      ipAddress = undefined;
+    }
+
     const existing = await query('SELECT * FROM departments WHERE id = $1', [id]);
     if (existing.rows.length === 0) {
       throw new Error(`Department with ID ${id} not found.`);
     }
     const currentDept = existing.rows[0];
 
-    // Hierarchy validation: circular check
-    if (dto.parent_id !== undefined) {
+    // Hierarchy validation: circular check and permission check
+    if (dto.parent_id !== undefined && dto.parent_id !== currentDept.parent_id) {
+      if (
+        actorPermissions.length > 0 &&
+        !actorPermissions.includes('departments:hierarchy') &&
+        !actorPermissions.includes('departments:create')
+      ) {
+        const err: any = new Error('Altering department hierarchy requires departments:hierarchy permission.');
+        err.statusCode = 403;
+        throw err;
+      }
       if (dto.parent_id === id) {
         throw new Error('A department cannot be its own parent.');
       }
@@ -374,10 +488,21 @@ export class DepartmentService {
     }
 
     // Validate manager if provided
-    if (dto.manager_id !== undefined && dto.manager_id !== null) {
-      const userCheck = await query('SELECT id FROM users WHERE id = $1', [dto.manager_id]);
-      if (userCheck.rows.length === 0) {
-        throw new Error(`User with ID ${dto.manager_id} specified as manager does not exist.`);
+    if (dto.manager_id !== undefined && dto.manager_id !== currentDept.manager_id) {
+      if (
+        actorPermissions.length > 0 &&
+        !actorPermissions.includes('departments:manage_manager') &&
+        !actorPermissions.includes('departments:create')
+      ) {
+        const err: any = new Error('Changing department manager requires departments:manage_manager permission.');
+        err.statusCode = 403;
+        throw err;
+      }
+      if (dto.manager_id !== null) {
+        const userCheck = await query('SELECT id FROM users WHERE id = $1', [dto.manager_id]);
+        if (userCheck.rows.length === 0) {
+          throw new Error(`User with ID ${dto.manager_id} specified as manager does not exist.`);
+        }
       }
     }
 

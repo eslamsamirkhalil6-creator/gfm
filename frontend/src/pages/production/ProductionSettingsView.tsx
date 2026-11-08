@@ -99,9 +99,24 @@ export const ProductionSettingsView: React.FC = () => {
 
       {/* Settings List */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-          Global Production Parameters
-        </h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            Global Production Parameters
+          </h2>
+          {!canManage && (
+            <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded bg-amber-950/60 border border-amber-800/60 text-amber-300 text-[11px] font-medium">
+              <Lock className="w-3 h-3 text-amber-400" />
+              <span>Read-Only Mode</span>
+            </span>
+          )}
+        </div>
+
+        {!canManage && (
+          <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg text-slate-400 text-xs flex items-center space-x-2">
+            <Lock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            <span>You have view-only access to factory policies. Updating parameters requires &apos;production:settings:manage&apos; authority.</span>
+          </div>
+        )}
 
         <div className="space-y-4">
           {settings.map((setting) => {

@@ -10,6 +10,7 @@ import { DiagnosticsPage } from './pages/DiagnosticsPage.tsx';
 import { ArchitectureExportPage } from './pages/ArchitectureExportPage.tsx';
 import { ProductionModule } from './pages/production/ProductionModule.tsx';
 import { DepartmentModule } from './pages/departments/DepartmentModule.tsx';
+import { MyDepartmentPage } from './pages/MyDepartmentPage.tsx';
 import { HealthCheckData } from './types/index.ts';
 import { ApiService } from './services/api.ts';
 
@@ -59,15 +60,24 @@ const MainLayout: React.FC = () => {
   const canViewDepartments = hasPermission('departments:view');
   const canViewUsers = hasPermission('users:read');
   const canViewAudit = hasPermission('audit:read');
+  const isDeptManager = (user.managed_department_ids && user.managed_department_ids.length > 0) || false;
+  const isSysAdmin = user.roles.includes('System Administrator');
+  const isFactoryManager = user.roles.includes('Factory Manager');
 
   const currentTab =
     activeTab === 'production' && !canViewProduction
       ? 'dashboard'
       : activeTab === 'departments' && !canViewDepartments
       ? 'dashboard'
+      : activeTab === 'my-department' && !isDeptManager
+      ? 'dashboard'
       : activeTab === 'users' && !canViewUsers
       ? 'dashboard'
       : activeTab === 'audit' && !canViewAudit
+      ? 'dashboard'
+      : activeTab === 'diagnostics' && !isSysAdmin
+      ? 'dashboard'
+      : activeTab === 'architecture' && !isSysAdmin && !isFactoryManager
       ? 'dashboard'
       : activeTab;
 
@@ -87,10 +97,11 @@ const MainLayout: React.FC = () => {
         )}
         {currentTab === 'production' && canViewProduction && <ProductionModule />}
         {currentTab === 'departments' && canViewDepartments && <DepartmentModule />}
+        {currentTab === 'my-department' && isDeptManager && <MyDepartmentPage />}
         {currentTab === 'users' && canViewUsers && <UsersManagementPage />}
         {currentTab === 'audit' && canViewAudit && <AuditLogsPage />}
-        {currentTab === 'diagnostics' && <DiagnosticsPage />}
-        {currentTab === 'architecture' && <ArchitectureExportPage />}
+        {currentTab === 'diagnostics' && isSysAdmin && <DiagnosticsPage />}
+        {currentTab === 'architecture' && (isSysAdmin || isFactoryManager) && <ArchitectureExportPage />}
       </main>
 
       {/* Industrial Footer */}

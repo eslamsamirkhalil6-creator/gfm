@@ -341,13 +341,15 @@ export const DepartmentListView: React.FC<DepartmentListViewProps> = ({
                             </button>
                           )}
 
-                          <button
-                            onClick={() => onDelete(dept)}
-                            title="Delete Department (Safety checked)"
-                            className="p-1.5 rounded-md hover:bg-rose-950/60 text-slate-500 hover:text-rose-400 transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {canCreate && (
+                            <button
+                              onClick={() => onDelete(dept)}
+                              title="Delete Department (Safety checked)"
+                              className="p-1.5 rounded-md hover:bg-rose-950/60 text-slate-500 hover:text-rose-400 transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     </td>

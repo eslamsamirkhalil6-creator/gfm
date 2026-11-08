@@ -5,7 +5,13 @@ import { UserController } from '../modules/users/user.controller.ts';
 import { AuditController } from '../modules/audit/audit.controller.ts';
 import { ProductionController } from '../modules/production/production.controller.ts';
 import { DepartmentController } from '../modules/departments/department.controller.ts';
-import { authenticateJWT, requirePermission, requireRole } from '../middleware/auth.middleware.ts';
+import {
+  authenticateJWT,
+  requirePermission,
+  requireRole,
+  requireDepartmentScope,
+  requireDepartmentListAccess,
+} from '../middleware/auth.middleware.ts';
 import { validateBody } from '../middleware/validation.middleware.ts';
 import { runAllTests } from '../tests/runner.ts';
 
@@ -241,7 +247,7 @@ apiRouter.put(
 apiRouter.get(
   '/departments/stats',
   authenticateJWT,
-  requirePermission('departments:view'),
+  requireDepartmentListAccess,
   DepartmentController.getStats
 );
 
@@ -249,7 +255,7 @@ apiRouter.get(
 apiRouter.get(
   '/departments',
   authenticateJWT,
-  requirePermission('departments:view'),
+  requireDepartmentListAccess,
   DepartmentController.listDepartments
 );
 
@@ -261,15 +267,23 @@ apiRouter.get(
   DepartmentController.getTree
 );
 
-// Single Department Details (Employees, Sub-departments, Manager History)
+// Single Department Details (Employees, Sub-departments, Manager History, Production Lines)
 apiRouter.get(
   '/departments/:id',
   authenticateJWT,
-  requirePermission('departments:view'),
+  requireDepartmentScope('view'),
   DepartmentController.getDepartment
 );
 
-// Create Department
+// Department Linked Production Lines
+apiRouter.get(
+  '/departments/:id/lines',
+  authenticateJWT,
+  requireDepartmentScope('view'),
+  DepartmentController.getLines
+);
+
+// Create Department (Admin only)
 apiRouter.post(
   '/departments',
   authenticateJWT,
@@ -278,15 +292,15 @@ apiRouter.post(
   DepartmentController.createDepartment
 );
 
-// Update Department
+// Update Department (Global editor or authorized Department Manager)
 apiRouter.put(
   '/departments/:id',
   authenticateJWT,
-  requirePermission('departments:edit'),
+  requireDepartmentScope('edit'),
   DepartmentController.updateDepartment
 );
 
-// Toggle Department Status (Activate / Deactivate)
+// Toggle Department Status (Activate / Deactivate - Admin only)
 apiRouter.put(
   '/departments/:id/status',
   authenticateJWT,
@@ -294,7 +308,7 @@ apiRouter.put(
   DepartmentController.toggleStatus
 );
 
-// Assign or Replace Department Manager
+// Assign or Replace Department Manager (Admin / Factory Manager only)
 apiRouter.put(
   '/departments/:id/manager',
   authenticateJWT,
@@ -302,33 +316,33 @@ apiRouter.put(
   DepartmentController.assignManager
 );
 
-// Assign Employee to Department
+// Assign Employee to Department (Global manager or authorized Department Manager)
 apiRouter.post(
   '/departments/:id/employees',
   authenticateJWT,
-  requirePermission('departments:manage_employees'),
+  requireDepartmentScope('manage_employees'),
   validateBody(['user_id', 'position_title']),
   DepartmentController.assignEmployee
 );
 
-// Transfer Employee to Another Department
+// Transfer Employee to Another Department (Global manager or authorized Department Manager)
 apiRouter.put(
   '/departments/:id/employees/transfer',
   authenticateJWT,
-  requirePermission('departments:manage_employees'),
+  requireDepartmentScope('manage_employees'),
   validateBody(['target_department_id', 'user_id']),
   DepartmentController.transferEmployee
 );
 
-// Remove Employee from Department
+// Remove Employee from Department (Global manager or authorized Department Manager)
 apiRouter.delete(
   '/departments/:id/employees/:userId',
   authenticateJWT,
-  requirePermission('departments:manage_employees'),
+  requireDepartmentScope('manage_employees'),
   DepartmentController.removeEmployee
 );
 
-// Delete Empty Unused Department (Strict Safety Constraint)
+// Delete Empty Unused Department (Strict Safety Constraint - Admin only)
 apiRouter.delete(
   '/departments/:id',
   authenticateJWT,
@@ -336,15 +350,20 @@ apiRouter.delete(
   DepartmentController.deleteDepartment
 );
 
-// Automated Tests Runner (Interactive diagnostics for prototype validation)
-apiRouter.get('/tests/run', authenticateJWT, async (req, res, next) => {
-  try {
-    const summary = await runAllTests();
-    res.status(200).json({
-      success: true,
-      data: summary,
-    });
-  } catch (err) {
-    next(err);
+// Automated Tests Runner (Restricted strictly to System Administrator)
+apiRouter.get(
+  '/tests/run',
+  authenticateJWT,
+  requireRole('System Administrator'),
+  async (req, res, next) => {
+    try {
+      const summary = await runAllTests();
+      res.status(200).json({
+        success: true,
+        data: summary,
+      });
+    } catch (err) {
+      next(err);
+    }
   }
-});
+);

@@ -13,6 +13,8 @@ interface DepartmentFormModalProps {
   defaultParentId?: number | null;
   departments: DepartmentWithDetails[];
   users: UserItem[];
+  canManageManager?: boolean;
+  canManageHierarchy?: boolean;
   onClose: () => void;
   onSuccess: () => void;
 }
@@ -22,6 +24,8 @@ export const DepartmentFormModal: React.FC<DepartmentFormModalProps> = ({
   defaultParentId,
   departments,
   users,
+  canManageManager = true,
+  canManageHierarchy = true,
   onClose,
   onSuccess,
 }) => {
@@ -157,7 +161,8 @@ export const DepartmentFormModal: React.FC<DepartmentFormModalProps> = ({
             <select
               value={parentId === null ? '' : parentId}
               onChange={(e) => setParentId(e.target.value === '' ? null : Number(e.target.value))}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-hidden focus:border-indigo-500"
+              disabled={!canManageHierarchy && isEdit}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-hidden focus:border-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <option value="">None (Top-Level Primary Division)</option>
               {validParents.map((p) => (
@@ -167,28 +172,42 @@ export const DepartmentFormModal: React.FC<DepartmentFormModalProps> = ({
               ))}
             </select>
             <p className="text-[10px] text-slate-500 mt-1">
-              Select a parent department to register this unit as a sub-department.
+              {!canManageHierarchy && isEdit
+                ? 'Hierarchy repositioning requires factory hierarchy authority.'
+                : 'Select a parent department to register this unit as a sub-department.'}
             </p>
           </div>
 
           {/* Appointed Manager */}
-          <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">
-              Department Manager (Optional)
-            </label>
-            <select
-              value={managerId === null ? '' : managerId}
-              onChange={(e) => setManagerId(e.target.value === '' ? null : Number(e.target.value))}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-hidden focus:border-indigo-500"
-            >
-              <option value="">No Manager Assigned (Vacant)</option>
-              {users.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.full_name} (@{u.username})
-                </option>
-              ))}
-            </select>
-          </div>
+          {canManageManager ? (
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Department Manager (Optional)
+              </label>
+              <select
+                value={managerId === null ? '' : managerId}
+                onChange={(e) => setManagerId(e.target.value === '' ? null : Number(e.target.value))}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-hidden focus:border-indigo-500"
+              >
+                <option value="">No Manager Assigned (Vacant)</option>
+                {users.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.full_name} (@{u.username})
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Department Manager
+              </label>
+              <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-400">
+                {initialDept?.manager_name ? `${initialDept.manager_name} (@${initialDept.manager_username})` : 'Unassigned'}
+                <span className="ml-2 text-[10px] text-slate-500 italic">(Manager appointment requires factory authority)</span>
+              </div>
+            </div>
+          )}
 
           {/* Description */}
           <div>

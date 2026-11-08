@@ -5,6 +5,8 @@ export interface CurrentUser {
   is_active: boolean;
   roles: string[];
   permissions: string[];
+  managed_department_ids: number[];
+  primary_department_id: number | null;
 }
 
 export interface UserItem {
@@ -215,6 +217,22 @@ export interface DepartmentWithDetails extends Department {
   manager_username: string | null;
   sub_department_count: number;
   employee_count: number;
+  production_lines_count?: number;
+  production_lines?: DepartmentProductionLine[];
+}
+
+export interface DepartmentProductionLine {
+  id: number;
+  line_number: string;
+  name: string;
+  hall_id: number;
+  hall_name: string | null;
+  production_type: string;
+  supervisor_id: number | null;
+  supervisor_name: string | null;
+  capacity_per_day: number;
+  status: string;
+  description: string | null;
 }
 
 export interface DepartmentEmployee {

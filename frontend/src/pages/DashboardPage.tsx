@@ -32,6 +32,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ health, setActiveT
   const isSysAdmin = hasRole('System Administrator');
   const isFactoryManager = hasRole('Factory Manager');
   const isDeptUser = hasRole('Department User');
+  const isDeptManager = (user?.managed_department_ids && user.managed_department_ids.length > 0) || false;
 
   return (
     <div className="space-y-6">
@@ -62,6 +63,16 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ health, setActiveT
           </div>
 
           <div className="flex items-center space-x-2">
+            {isDeptManager && (
+              <button
+                onClick={() => setActiveTab('my-department')}
+                className="px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition-colors flex items-center space-x-1.5 cursor-pointer shadow-xs"
+              >
+                <Building2 className="w-3.5 h-3.5" />
+                <span>My Department</span>
+              </button>
+            )}
+
             {hasPermission('production:view') && (
               <button
                 onClick={() => setActiveTab('production')}
@@ -104,6 +115,34 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ health, setActiveT
           </div>
         </div>
       </div>
+
+      {/* Department Manager Dedicated Banner */}
+      {isDeptManager && (
+        <div className="bg-indigo-950/30 border border-indigo-800/40 rounded-xl p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-start space-x-3">
+              <div className="p-2 rounded bg-indigo-900/50 text-indigo-400 border border-indigo-700/50">
+                <Building2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-indigo-200">
+                  Department Manager Workspace Available
+                </h2>
+                <p className="text-xs text-indigo-300/80 mt-1 leading-relaxed">
+                  You are the appointed manager for {user?.managed_department_ids?.length} department(s). You have authority over your assigned department&apos;s staff allocations, linked production line status, and operational details.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setActiveTab('my-department')}
+              className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white flex items-center space-x-1.5 transition-colors cursor-pointer shrink-0 shadow-sm"
+            >
+              <span>Open My Department</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Role-Specific Content Area */}
       {isDeptUser && !isSysAdmin && !isFactoryManager && (
@@ -295,19 +334,25 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ health, setActiveT
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-slate-400">Status:</span>
-                <span className="text-emerald-400 font-medium">23/23 Passed (Parts 1-3)</span>
+                <span className="text-emerald-400 font-medium">37/37 Passed (Foundation, Production & Scoped RBAC)</span>
               </div>
             </div>
           </div>
 
-          <button
-            onClick={() => setActiveTab('diagnostics')}
-            className="mt-5 w-full py-2 px-3 rounded-md bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition-colors flex items-center justify-center space-x-1.5 cursor-pointer"
-          >
-            <Activity className="w-3.5 h-3.5 text-amber-400" />
-            <span>Open Automated Test Suite</span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
+          {isSysAdmin ? (
+            <button
+              onClick={() => setActiveTab('diagnostics')}
+              className="mt-5 w-full py-2 px-3 rounded-md bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition-colors flex items-center justify-center space-x-1.5 cursor-pointer"
+            >
+              <Activity className="w-3.5 h-3.5 text-amber-400" />
+              <span>Open Automated Test Suite</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          ) : (
+            <div className="mt-5 p-2 rounded bg-slate-950 border border-slate-800 text-[11px] text-slate-400 text-center">
+              Automated integration testing restricted to System Administrators
+            </div>
+          )}
         </div>
       </div>
 

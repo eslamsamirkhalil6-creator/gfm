@@ -104,11 +104,26 @@ export async function initDatabase(): Promise<void> {
         }
       }
 
+      // Check if Part 4 Department Manager role exists
+      const checkDeptManager = await pool.query(
+        "SELECT count(*) FROM roles WHERE role_name = 'Department Manager'"
+      );
+      if (parseInt(checkDeptManager.rows[0].count, 10) === 0) {
+        console.log('[DB] Applying Part 4 Department Manager migrations & seeds...');
+        for (const file of migrationFiles.filter(f => f.startsWith('004_'))) {
+          const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+          await pool.query(sql);
+        }
+        for (const file of seedFiles.filter(f => f.startsWith('004_'))) {
+          const sql = fs.readFileSync(path.join(seedsDir, file), 'utf8');
+          await pool.query(sql);
+        }
+      }
+
       isInitialized = true;
       return;
     } catch (err: any) {
-      console.warn('[DB] Live PostgreSQL connection failed or unavailable:', err.message);
-      console.warn('[DB] Falling back to high-fidelity PostgreSQL In-Memory Engine for preview and testing.');
+      console.log('[DB] Live PostgreSQL unavailable (' + err.message + '). Active engine: PostgreSQL In-Memory Engine (pg-mem).');
     }
   }
 

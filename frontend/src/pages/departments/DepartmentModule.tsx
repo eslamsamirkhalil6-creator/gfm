@@ -286,6 +286,8 @@ export const DepartmentModule: React.FC = () => {
           defaultParentId={defaultParentId}
           departments={departments}
           users={users}
+          canManageManager={canManageManager}
+          canManageHierarchy={hasPermission('departments:hierarchy')}
           onClose={() => {
             setFormModalOpen(false);
             setEditingDept(null);

@@ -20,6 +20,7 @@ import {
   DepartmentWithDetails,
   DepartmentEmployee,
   DepartmentManagerHistoryItem,
+  DepartmentProductionLine,
 } from '../../types/index.ts';
 
 interface DepartmentDetailModalProps {
@@ -206,6 +207,56 @@ export const DepartmentDetailModal: React.FC<DepartmentDetailModalProps> = ({
               </div>
             </div>
           )}
+
+          {/* Linked Production Lines Section */}
+          <div className="space-y-3">
+            <div className="flex items-center space-x-2">
+              <Layers className="w-4 h-4 text-emerald-400" />
+              <h3 className="text-xs font-bold text-white">
+                Linked Production Lines ({details?.department?.production_lines?.length || 0})
+              </h3>
+            </div>
+
+            {details?.department?.production_lines && details.department.production_lines.length > 0 ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                {details.department.production_lines.map((line: DepartmentProductionLine) => (
+                  <div
+                    key={line.id}
+                    className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg flex flex-col justify-between"
+                  >
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <span className="font-mono text-[10px] text-emerald-400 font-bold px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-900/60">
+                          {line.line_number}
+                        </span>
+                        <div className="text-xs font-semibold text-white mt-1">{line.name}</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">
+                          Hall: {line.hall_name || 'Unassigned'} · Type: {line.production_type}
+                        </div>
+                      </div>
+                      <span
+                        className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${
+                          line.status === 'active'
+                            ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                            : 'bg-slate-800 text-slate-400 border-slate-700'
+                        }`}
+                      >
+                        {line.status}
+                      </span>
+                    </div>
+                    <div className="mt-2 pt-2 border-t border-slate-850 flex items-center justify-between text-[10px] text-slate-400">
+                      <span>Cap: {line.capacity_per_day?.toLocaleString() || 0} pcs/day</span>
+                      <span>Sup: {line.supervisor_name || 'None'}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="p-3 bg-slate-950/40 border border-slate-850 rounded-lg text-slate-500 text-xs italic">
+                No production lines currently linked to this department.
+              </div>
+            )}
+          </div>
 
           {/* Assigned Employees List */}
           <div className="space-y-3">

@@ -17,11 +17,18 @@ export class DepartmentController {
       const parentId = req.query.parent_id !== undefined ? Number(req.query.parent_id) : undefined;
       const search = req.query.search as string | undefined;
 
-      const departments = await DepartmentService.listDepartments({
-        status,
-        parent_id: parentId,
-        search,
-      });
+      const hasGlobal = req.user?.permissions.includes('departments:view') ?? false;
+      const actorId = req.user?.id;
+
+      const departments = await DepartmentService.listDepartments(
+        {
+          status,
+          parent_id: parentId,
+          search,
+        },
+        actorId,
+        hasGlobal
+      );
 
       res.status(200).json({ success: true, data: departments });
     } catch (err) {
@@ -53,6 +60,21 @@ export class DepartmentController {
     }
   }
 
+  static async getLines(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        res.status(400).json({ success: false, message: 'Invalid department ID.' });
+        return;
+      }
+
+      const lines = await DepartmentService.getDepartmentLines(id);
+      res.status(200).json({ success: true, data: lines });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   static async createDepartment(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actorId = (req as any).user?.id || 1;
@@ -75,8 +97,15 @@ export class DepartmentController {
 
       const actorId = (req as any).user?.id || 1;
       const ipAddress = req.ip;
+      const actorPermissions = req.user?.permissions || [];
 
-      const updated = await DepartmentService.updateDepartment(id, req.body, actorId, ipAddress);
+      const updated = await DepartmentService.updateDepartment(
+        id,
+        req.body,
+        actorId,
+        ipAddress,
+        actorPermissions
+      );
       res.status(200).json({ success: true, message: 'Department updated successfully', data: updated });
     } catch (err) {
       next(err);

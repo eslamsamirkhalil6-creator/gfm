@@ -15,6 +15,7 @@ import {
   TransferEmployeeDTO,
   DepartmentEmployee,
   DepartmentManagerHistoryItem,
+  DepartmentProductionLine,
 } from '../types/index.ts';
 
 const TOKEN_KEY = 'gfms_auth_token';
@@ -473,6 +474,15 @@ export class ApiService {
         employees: DepartmentEmployee[];
         manager_history: DepartmentManagerHistoryItem[];
       };
+    }>(res);
+    return result.data;
+  }
+
+  static async getDepartmentLines(deptId: number): Promise<DepartmentProductionLine[]> {
+    const res = await fetch(`/api/departments/${deptId}/lines`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: DepartmentProductionLine[];
     }>(res);
     return result.data;
   }

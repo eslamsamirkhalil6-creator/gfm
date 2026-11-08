@@ -131,6 +131,14 @@ export class AuthService {
       ipAddress,
     });
 
+    // Fetch departments authoritatively managed by this user
+    const managedDeptsRes = await query<{ id: number }>(
+      `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
+      [user.id]
+    );
+    const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
+    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+
     return {
       token,
       expiresIn: env.JWT_EXPIRES_IN,
@@ -141,6 +149,8 @@ export class AuthService {
         is_active: user.is_active,
         roles,
         permissions,
+        managed_department_ids,
+        primary_department_id,
       },
     };
   }

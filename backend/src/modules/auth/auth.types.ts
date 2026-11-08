@@ -8,6 +8,8 @@ export interface LoginResponse {
     is_active: boolean;
     roles: string[];
     permissions: string[];
+    managed_department_ids: number[];
+    primary_department_id: number | null;
   };
 }
 
@@ -18,5 +20,8 @@ export interface UserProfile {
   is_active: boolean;
   roles: string[];
   permissions: string[];
+  managed_department_ids: number[];
+  primary_department_id: number | null;
   created_at: string;
 }
+

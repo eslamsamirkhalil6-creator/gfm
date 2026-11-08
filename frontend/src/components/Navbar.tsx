@@ -15,7 +15,7 @@ import {
 import { useAuth } from '../hooks/useAuth.tsx';
 import { HealthCheckData } from '../types/index.ts';
 
-export type ActiveTab = 'dashboard' | 'production' | 'departments' | 'users' | 'audit' | 'diagnostics' | 'architecture';
+export type ActiveTab = 'dashboard' | 'production' | 'departments' | 'my-department' | 'users' | 'audit' | 'diagnostics' | 'architecture';
 
 interface NavbarProps {
   activeTab: ActiveTab;
@@ -24,7 +24,7 @@ interface NavbarProps {
 }
 
 export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health }) => {
-  const { user, logout, hasPermission } = useAuth();
+  const { user, logout, hasPermission, hasRole } = useAuth();
 
   const isDbConnected = health?.database?.status === 'CONNECTED';
   const isApiUp = health?.status === 'UP';
@@ -91,6 +91,20 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               </button>
             )}
 
+            {user?.managed_department_ids && user.managed_department_ids.length > 0 && (
+              <button
+                onClick={() => setActiveTab('my-department')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                  activeTab === 'my-department'
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-indigo-300 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <Building2 className="w-3.5 h-3.5 text-indigo-300" />
+                <span>My Department</span>
+              </button>
+            )}
+
             {hasPermission('users:read') && (
               <button
                 onClick={() => setActiveTab('users')}
@@ -119,29 +133,33 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               </button>
             )}
 
-            <button
-              onClick={() => setActiveTab('diagnostics')}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
-                activeTab === 'diagnostics'
-                  ? 'bg-slate-800 text-white border border-slate-700'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              <Activity className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Automated Tests</span>
-            </button>
+            {hasRole('System Administrator') && (
+              <button
+                onClick={() => setActiveTab('diagnostics')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                  activeTab === 'diagnostics'
+                    ? 'bg-slate-800 text-white border border-slate-700'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                }`}
+              >
+                <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Automated Tests</span>
+              </button>
+            )}
 
-            <button
-              onClick={() => setActiveTab('architecture')}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
-                activeTab === 'architecture'
-                  ? 'bg-slate-800 text-white border border-slate-700'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              <Code2 className="w-3.5 h-3.5 text-amber-400" />
-              <span>Architecture & Export</span>
-            </button>
+            {(hasRole('System Administrator') || hasRole('Factory Manager')) && (
+              <button
+                onClick={() => setActiveTab('architecture')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                  activeTab === 'architecture'
+                    ? 'bg-slate-800 text-white border border-slate-700'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                }`}
+              >
+                <Code2 className="w-3.5 h-3.5 text-amber-400" />
+                <span>Architecture & Export</span>
+              </button>
+            )}
           </nav>
 
           {/* User Info & Connection Badges */}

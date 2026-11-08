@@ -10,6 +10,8 @@ export interface AuthenticatedUser {
   is_active: boolean;
   roles: string[];
   permissions: string[];
+  managed_department_ids: number[];
+  primary_department_id: number | null;
 }
 
 declare global {
@@ -101,6 +103,14 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       [user.id]
     );
 
+    // Fetch departments authoritatively managed by this user
+    const managedDeptsRes = await query<{ id: number }>(
+      `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
+      [user.id]
+    );
+    const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
+    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+
     req.user = {
       id: user.id,
       username: user.username,
@@ -108,6 +118,8 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       is_active: user.is_active,
       roles: rolesRes.rows.map(r => r.role_name),
       permissions: permRes.rows.map(p => p.permission_key),
+      managed_department_ids,
+      primary_department_id,
     };
 
     next();
@@ -193,3 +205,133 @@ export function requireRole(...requiredRoles: string[]) {
     next();
   };
 }
+
+/**
+ * Middleware enforcing department-scoped RBAC.
+ * Allows access if:
+ * 1. User has the global permission (e.g. System Administrator or Factory Manager).
+ * 2. OR User has 'Department Manager' role (or 'departments:scoped:manage' / 'departments:scoped:view')
+ *    AND authoritatively manages the requested department.
+ */
+export function requireDepartmentScope(action: 'view' | 'edit' | 'manage_employees') {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      });
+      return;
+    }
+
+    const globalPermMap = {
+      view: 'departments:view',
+      edit: 'departments:edit',
+      manage_employees: 'departments:manage_employees',
+    };
+    const requiredGlobalPerm = globalPermMap[action];
+
+    // Check global permission first (System Administrator, Factory Manager)
+    if (req.user.permissions.includes(requiredGlobalPerm)) {
+      return next();
+    }
+
+    // Check if user is a Department Manager
+    const isDeptManager =
+      req.user.roles.includes('Department Manager') ||
+      req.user.permissions.includes('departments:scoped:manage') ||
+      req.user.permissions.includes('departments:scoped:view');
+
+    if (!isDeptManager) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: `Access denied. Missing required permission: ${requiredGlobalPerm}`,
+        },
+      });
+      return;
+    }
+
+    // Resolve target department ID from params or body
+    const rawId = req.params.id || req.body.department_id || req.body.source_department_id;
+    const deptId = parseInt(String(rawId), 10);
+
+    if (isNaN(deptId)) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'BAD_REQUEST', message: 'Valid department ID is required' },
+      });
+      return;
+    }
+
+    // Authoritative database check: Verify that departments.manager_id === req.user.id
+    try {
+      const deptRes = await query<{ id: number; manager_id: number | null }>(
+        'SELECT id, manager_id FROM departments WHERE id = $1',
+        [deptId]
+      );
+
+      if (deptRes.rowCount === 0) {
+        res.status(404).json({
+          success: false,
+          error: { code: 'NOT_FOUND', message: `Department #${deptId} not found` },
+        });
+        return;
+      }
+
+      if (deptRes.rows[0].manager_id !== req.user.id) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: `Access denied. You are not authorized to manage Department #${deptId}.`,
+          },
+        });
+        return;
+      }
+
+      // Department Manager specific action constraints
+      if (action === 'edit') {
+        if (req.body.manager_id !== undefined || req.body.parent_id !== undefined || req.body.status !== undefined) {
+          res.status(403).json({
+            success: false,
+            error: {
+              code: 'FORBIDDEN',
+              message: 'Department managers are not permitted to reassign managers, alter hierarchy, or change department status.',
+            },
+          });
+          return;
+        }
+      }
+
+      next();
+    } catch (err: any) {
+      next(err);
+    }
+  };
+}
+
+/**
+ * Middleware allowing department list access to global viewers or department managers
+ */
+export function requireDepartmentListAccess(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user) {
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+    return;
+  }
+
+  const hasGlobal = req.user.permissions.includes('departments:view');
+  const isDeptManager =
+    req.user.roles.includes('Department Manager') ||
+    req.user.permissions.includes('departments:scoped:view');
+
+  if (hasGlobal || isDeptManager) {
+    return next();
+  }
+
+  res.status(403).json({
+    success: false,
+    error: { code: 'FORBIDDEN', message: 'Access denied. Missing required permission(s): departments:view' },
+  });
+}
+

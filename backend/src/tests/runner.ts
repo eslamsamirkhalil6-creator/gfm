@@ -6,6 +6,12 @@ import { AuthService } from '../modules/auth/auth.service.ts';
 import { UserService } from '../modules/users/user.service.ts';
 import { AuditService } from '../modules/audit/audit.service.ts';
 import { DepartmentService } from '../modules/departments/department.service.ts';
+import {
+  requireDepartmentScope,
+  requireDepartmentListAccess,
+  requireRole,
+  requirePermission,
+} from '../middleware/auth.middleware.ts';
 
 export interface TestResult {
   id: number;
@@ -792,6 +798,447 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
     }
 
     return `All 15 PostgreSQL tables verified across Foundation (Part 1), Production (Part 2), and Department Management (Part 3)`;
+  });
+
+  // Helper to execute Express middleware for security verification
+  async function testMiddleware(
+    middleware: any,
+    req: any
+  ): Promise<{ status: number; body?: any; nextCalled: boolean }> {
+    let status = 200;
+    let body: any = null;
+    let nextCalled = false;
+    const res: any = {
+      status(code: number) {
+        status = code;
+        return this;
+      },
+      json(data: any) {
+        body = data;
+        return this;
+      },
+    };
+    await new Promise<void>((resolve, reject) => {
+      try {
+        middleware(req, res, (err?: any) => {
+          if (err) return reject(err);
+          nextCalled = true;
+          resolve();
+        });
+        setTimeout(() => resolve(), 30);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    return { status, body, nextCalled };
+  }
+
+  // 24. System Administrator Global Department Access
+  await executeTest(24, 'System Administrator Global Department Authority', 'RBAC & Scoped Auth', async () => {
+    const adminUser = {
+      id: 1,
+      username: 'admin',
+      roles: ['System Administrator'],
+      permissions: [
+        'departments:view',
+        'departments:create',
+        'departments:edit',
+        'departments:manage_employees',
+        'departments:manage_manager',
+        'departments:status',
+        'departments:hierarchy',
+      ],
+      managed_department_ids: [],
+      primary_department_id: null,
+    };
+
+    const viewDept11 = await testMiddleware(requireDepartmentScope('view'), { user: adminUser, params: { id: '11' } });
+    const viewDept12 = await testMiddleware(requireDepartmentScope('view'), { user: adminUser, params: { id: '12' } });
+    const editDept11 = await testMiddleware(requireDepartmentScope('edit'), { user: adminUser, params: { id: '11' }, body: {} });
+    const manageDept12 = await testMiddleware(requireDepartmentScope('manage_employees'), { user: adminUser, params: { id: '12' }, body: {} });
+
+    if (!viewDept11.nextCalled || !viewDept12.nextCalled || !editDept11.nextCalled || !manageDept12.nextCalled) {
+      throw new Error('System Administrator was improperly blocked on department operations');
+    }
+
+    return 'System Administrator retains full unrestricted access across all department endpoints regardless of manager assignment';
+  });
+
+  // 25. Factory Manager Global Operational Capabilities
+  await executeTest(25, 'Factory Manager Global Operational Department Capabilities', 'RBAC & Scoped Auth', async () => {
+    const factoryManagerUser = {
+      id: 2,
+      username: 'manager',
+      roles: ['Factory Manager'],
+      permissions: ['departments:view', 'departments:edit', 'departments:manage_employees'],
+      managed_department_ids: [],
+      primary_department_id: null,
+    };
+
+    const viewDept11 = await testMiddleware(requireDepartmentScope('view'), { user: factoryManagerUser, params: { id: '11' } });
+    const viewDept12 = await testMiddleware(requireDepartmentScope('view'), { user: factoryManagerUser, params: { id: '12' } });
+    const manageDept11 = await testMiddleware(requireDepartmentScope('manage_employees'), { user: factoryManagerUser, params: { id: '11' }, body: {} });
+
+    if (!viewDept11.nextCalled || !viewDept12.nextCalled || !manageDept11.nextCalled) {
+      throw new Error('Factory Manager was improperly blocked from operational department capabilities');
+    }
+
+    return 'Factory Manager retains global operational capabilities (view, edit details, manage employees) across factory departments';
+  });
+
+  // 26. Department Manager Access to Assigned Department
+  await executeTest(26, 'Department Manager Scoped Assigned Department Access', 'RBAC & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const viewOwn = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '11' } });
+    if (!viewOwn.nextCalled) {
+      throw new Error(`Department Manager was rejected for assigned department #11 (status: ${viewOwn.status})`);
+    }
+
+    const details = await DepartmentService.getDepartmentById(11);
+    if (!details.department || details.department.id !== 11) {
+      throw new Error('Failed to retrieve department details');
+    }
+
+    const lines = await DepartmentService.getDepartmentLines(11);
+
+    return `Department Manager authorized for assigned department #11 (DEP-CUT) with ${lines.length} linked production lines returned`;
+  });
+
+  // 27. Department Manager Employee Allocation in Assigned Department
+  await executeTest(27, 'Department Manager Employee Allocation within Scope', 'RBAC & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const assignScope = await testMiddleware(requireDepartmentScope('manage_employees'), {
+      user: deptManagerUser,
+      params: { id: '11' },
+      body: { user_id: 2, position_title: 'Cutting Floor Overseer' },
+    });
+
+    if (!assignScope.nextCalled) {
+      throw new Error(`Department Manager was rejected from managing employees in assigned department #11`);
+    }
+
+    return 'Department Manager authorized to allocate workforce in assigned department #11';
+  });
+
+  // 28. Department Manager Cross-Department Access Rejection (HTTP 403)
+  await executeTest(28, 'Department Manager Cross-Department View Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const crossView = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '12' } });
+
+    if (crossView.nextCalled || crossView.status !== 403) {
+      throw new Error(`Expected HTTP 403 for unassigned department #12, got status: ${crossView.status}`);
+    }
+
+    return `Cross-department inspection attempt on department #12 rejected with HTTP 403: "${crossView.body?.error?.message}"`;
+  });
+
+  // 29. Department Manager Cross-Department Employee Allocation Rejection (HTTP 403)
+  await executeTest(29, 'Department Manager Cross-Department Employee Allocation Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const crossAssign = await testMiddleware(requireDepartmentScope('manage_employees'), {
+      user: deptManagerUser,
+      params: { id: '12' },
+      body: { user_id: 1, position_title: 'Sewing Tech' },
+    });
+
+    if (crossAssign.nextCalled || crossAssign.status !== 403) {
+      throw new Error(`Expected HTTP 403 for cross-department employee assignment, got: ${crossAssign.status}`);
+    }
+
+    return 'Cross-department employee allocation rejected with HTTP 403 Forbidden';
+  });
+
+  // 30. Department Manager Manager Appointment Rejection (HTTP 403)
+  await executeTest(30, 'Department Manager Manager Appointment Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    // Attempting to pass manager_id in update
+    const editWithManager = await testMiddleware(requireDepartmentScope('edit'), {
+      user: deptManagerUser,
+      params: { id: '11' },
+      body: { manager_id: 2 },
+    });
+
+    if (editWithManager.nextCalled || editWithManager.status !== 403) {
+      throw new Error(`Expected HTTP 403 for manager_id tampering in edit, got status: ${editWithManager.status}`);
+    }
+
+    // Direct service check
+    let serviceRejected = false;
+    try {
+      await DepartmentService.updateDepartment(
+        11,
+        { manager_id: 2 },
+        deptManagerUser.id,
+        undefined,
+        ['departments:scoped:manage']
+      );
+    } catch (err: any) {
+      serviceRejected = err.statusCode === 403;
+    }
+
+    if (!serviceRejected) {
+      throw new Error('Service updateDepartment did not reject manager_id modification without departments:manage_manager');
+    }
+
+    return 'Manager appointment and replacement attempts by Department Manager rejected with HTTP 403 at both middleware and service layers';
+  });
+
+  // 31. Department Manager Delete & Deactivate Rejection (HTTP 403)
+  await executeTest(31, 'Department Manager Deletion and Status Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const permCheckCreate = await testMiddleware(requirePermission('departments:create'), { user: deptManagerUser });
+    const permCheckStatus = await testMiddleware(requirePermission('departments:status'), { user: deptManagerUser });
+
+    if (permCheckCreate.nextCalled || permCheckCreate.status !== 403) {
+      throw new Error('Department Manager should not have departments:create permission');
+    }
+    if (permCheckStatus.nextCalled || permCheckStatus.status !== 403) {
+      throw new Error('Department Manager should not have departments:status permission');
+    }
+
+    return 'Department deletion and deactivation endpoints strictly blocked for Department Manager role (HTTP 403)';
+  });
+
+  // 32. Department Manager Hierarchy Modification Rejection (HTTP 403)
+  await executeTest(32, 'Department Manager Hierarchy Modification Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    const editHierarchy = await testMiddleware(requireDepartmentScope('edit'), {
+      user: deptManagerUser,
+      params: { id: '11' },
+      body: { parent_id: 12 },
+    });
+
+    if (editHierarchy.nextCalled || editHierarchy.status !== 403) {
+      throw new Error(`Expected HTTP 403 for hierarchy manipulation, got: ${editHierarchy.status}`);
+    }
+
+    let serviceRejected = false;
+    try {
+      await DepartmentService.updateDepartment(
+        11,
+        { parent_id: 12 },
+        deptManagerUser.id,
+        undefined,
+        ['departments:scoped:manage']
+      );
+    } catch (err: any) {
+      serviceRejected = err.statusCode === 403;
+    }
+
+    if (!serviceRejected) {
+      throw new Error('DepartmentService allowed parent_id change without departments:hierarchy permission');
+    }
+
+    return 'Hierarchy reclassification attempts by Department Manager rejected with HTTP 403 at middleware and service layers';
+  });
+
+  // 33. Ordinary Department User Access Rejection (HTTP 403)
+  await executeTest(33, 'Ordinary Department User Management Access Rejection (HTTP 403)', 'Security & Scoped Auth', async () => {
+    const regularUser = {
+      id: 99,
+      username: 'operator',
+      roles: ['Department User'],
+      permissions: ['dashboard:view'],
+      managed_department_ids: [],
+      primary_department_id: null,
+    };
+
+    const listCheck = await testMiddleware(requireDepartmentListAccess, { user: regularUser });
+    const viewCheck = await testMiddleware(requireDepartmentScope('view'), { user: regularUser, params: { id: '11' } });
+    const manageCheck = await testMiddleware(requireDepartmentScope('manage_employees'), { user: regularUser, params: { id: '11' } });
+
+    if (listCheck.nextCalled || listCheck.status !== 403) {
+      throw new Error('Ordinary Department User should be rejected from department list access');
+    }
+    if (viewCheck.nextCalled || viewCheck.status !== 403) {
+      throw new Error('Ordinary Department User should be rejected from department scope view');
+    }
+    if (manageCheck.nextCalled || manageCheck.status !== 403) {
+      throw new Error('Ordinary Department User should be rejected from department employee management');
+    }
+
+    return 'Ordinary Department User rejected with HTTP 403 across all department management operations';
+  });
+
+  // 34. Immediate Revocation on Manager Relinquishment (Authoritative DB check)
+  await executeTest(34, 'Immediate Revocation on Manager Relinquishment in PostgreSQL', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    // Temporarily unassign manager in PostgreSQL
+    await query('UPDATE departments SET manager_id = NULL WHERE id = 11');
+
+    try {
+      const revokedCheck = await testMiddleware(requireDepartmentScope('view'), {
+        user: deptManagerUser,
+        params: { id: '11' },
+      });
+
+      if (revokedCheck.nextCalled || revokedCheck.status !== 403) {
+        throw new Error(`Immediate revocation failed: expected HTTP 403 after manager unassignment, got: ${revokedCheck.status}`);
+      }
+    } finally {
+      // Restore manager assignment
+      await query('UPDATE departments SET manager_id = 3 WHERE id = 11');
+    }
+
+    const restoredCheck = await testMiddleware(requireDepartmentScope('view'), {
+      user: deptManagerUser,
+      params: { id: '11' },
+    });
+
+    if (!restoredCheck.nextCalled) {
+      throw new Error('Restored department manager assignment did not grant access');
+    }
+
+    return 'Immediate revocation confirmed: authorization relies authoritatively on live database state, instantly terminating access upon tenure end';
+  });
+
+  // 35. Multi-Department Scoped Access Integrity
+  await executeTest(35, 'Multi-Department Scoped Access Boundaries', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11, 14],
+      primary_department_id: 11,
+    };
+
+    // Temporarily assign user 3 to department 14 as well
+    await query('UPDATE departments SET manager_id = 3 WHERE id = 14');
+
+    try {
+      const access11 = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '11' } });
+      const access14 = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '14' } });
+      const access12 = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '12' } });
+      const access13 = await testMiddleware(requireDepartmentScope('view'), { user: deptManagerUser, params: { id: '13' } });
+
+      if (!access11.nextCalled || !access14.nextCalled) {
+        throw new Error('User managing multiple departments was improperly blocked from assigned departments');
+      }
+      if (access12.nextCalled || access12.status !== 403) {
+        throw new Error('User managing multiple departments was improperly granted access to unassigned department #12');
+      }
+      if (access13.nextCalled || access13.status !== 403) {
+        throw new Error('User managing multiple departments was improperly granted access to unassigned department #13');
+      }
+    } finally {
+      // Revert dept 14 manager
+      await query('UPDATE departments SET manager_id = NULL WHERE id = 14');
+    }
+
+    return 'User managing multiple departments accesses each authorized department (#11, #14) while strictly isolated from unassigned departments (#12, #13)';
+  });
+
+  // 36. Department ID Parameter Spoofing Prevention
+  await executeTest(36, 'Department ID Parameter Spoofing Prevention', 'Security & Scoped Auth', async () => {
+    const deptManagerUser = {
+      id: 3,
+      username: 'deptuser',
+      roles: ['Department Manager'],
+      permissions: ['departments:scoped:view', 'departments:scoped:manage'],
+      managed_department_ids: [11],
+      primary_department_id: 11,
+    };
+
+    // Attacker sends params.id = 12 while having valid session for department 11
+    const spoofAttempt = await testMiddleware(requireDepartmentScope('view'), {
+      user: deptManagerUser,
+      params: { id: '12' },
+      body: { department_id: 11 },
+    });
+
+    if (spoofAttempt.nextCalled || spoofAttempt.status !== 403) {
+      throw new Error(`Parameter spoofing was not blocked: expected HTTP 403, got status ${spoofAttempt.status}`);
+    }
+
+    return 'Parameter spoofing prevented: backend validates requested target ID authoritatively against database records';
+  });
+
+  // 37. Automated Tests & Admin Endpoint Gating
+  await executeTest(37, 'Automated Test Runner Gated Exclusively to System Administrator', 'Security & RBAC', async () => {
+    const adminUser = { id: 1, roles: ['System Administrator'] };
+    const managerUser = { id: 2, roles: ['Factory Manager'] };
+    const deptManagerUser = { id: 3, roles: ['Department Manager'] };
+
+    const adminCheck = await testMiddleware(requireRole('System Administrator'), { user: adminUser });
+    const managerCheck = await testMiddleware(requireRole('System Administrator'), { user: managerUser });
+    const deptManagerCheck = await testMiddleware(requireRole('System Administrator'), { user: deptManagerUser });
+
+    if (!adminCheck.nextCalled) {
+      throw new Error('System Administrator was improperly blocked from test runner');
+    }
+    if (managerCheck.nextCalled || managerCheck.status !== 403) {
+      throw new Error('Factory Manager was not blocked from test runner (HTTP 403 expected)');
+    }
+    if (deptManagerCheck.nextCalled || deptManagerCheck.status !== 403) {
+      throw new Error('Department Manager was not blocked from test runner (HTTP 403 expected)');
+    }
+
+    return 'Automated integration test runner endpoint /api/tests/run strictly restricted to System Administrator role';
   });
 
   const passed = results.filter(r => r.status === 'PASSED').length;
