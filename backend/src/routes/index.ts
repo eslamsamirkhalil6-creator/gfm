@@ -5,6 +5,7 @@ import { UserController } from '../modules/users/user.controller.ts';
 import { AuditController } from '../modules/audit/audit.controller.ts';
 import { ProductionController } from '../modules/production/production.controller.ts';
 import { DepartmentController } from '../modules/departments/department.controller.ts';
+import { wmsRouter } from '../modules/warehouse/warehouse.routes.ts';
 import {
   authenticateJWT,
   requirePermission,
@@ -359,6 +360,11 @@ apiRouter.delete(
   requirePermission('departments:create'),
   DepartmentController.deleteDepartment
 );
+
+// ==========================================
+// Warehouse & Inventory Management System (Phase 04)
+// ==========================================
+apiRouter.use('/', wmsRouter);
 
 // Automated Tests Runner (Restricted strictly to System Administrator)
 apiRouter.get(

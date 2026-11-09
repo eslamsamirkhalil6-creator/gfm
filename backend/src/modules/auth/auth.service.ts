@@ -139,6 +139,31 @@ export class AuthService {
     const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
     const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
 
+    // Fetch warehouses authoritatively assigned to this user (active warehouse_staff or manager_id)
+    const [whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+      query<{ warehouse_id: number }>(
+        `SELECT warehouse_id FROM warehouse_staff
+         WHERE user_id = $1 AND status = 'active'
+           AND effective_from <= CURRENT_DATE
+           AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)`,
+        [user.id]
+      ),
+      query<{ id: number }>(
+        `SELECT id FROM warehouses WHERE manager_id = $1 AND status = 'active'`,
+        [user.id]
+      ),
+      query<{ id: number }>(
+        `SELECT id FROM production_lines WHERE supervisor_id = $1 ORDER BY id ASC`,
+        [user.id]
+      ),
+    ]);
+
+    const warehouseIdSet = new Set<number>();
+    for (const r of whStaffRes.rows) warehouseIdSet.add(r.warehouse_id);
+    for (const r of whMgrRes.rows) warehouseIdSet.add(r.id);
+    const managed_warehouse_ids = Array.from(warehouseIdSet).sort((a, b) => a - b);
+    const supervised_line_ids = supLinesRes.rows.map(r => r.id);
+
     return {
       token,
       expiresIn: env.JWT_EXPIRES_IN,
@@ -151,6 +176,8 @@ export class AuthService {
         permissions,
         managed_department_ids,
         primary_department_id,
+        managed_warehouse_ids,
+        supervised_line_ids,
       },
     };
   }

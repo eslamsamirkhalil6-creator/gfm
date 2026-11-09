@@ -284,4 +284,10 @@ Removes an employee assignment from a department.
 Permanently deletes an empty, unused department. Strictly blocked if the department has assigned employees, sub-departments, or linked production lines (deactivation required instead).
 - **Permission Required:** `departments:create`
 
+---
 
+## 7. Warehouse & Inventory Management System (WMS – GFMS v0.3)
+
+All Warehouse, Material Catalog, GRN, QC Inspection, Requisition, Issuing, Return, Transfer, Stock Count, Adjustment, Reorder, Finished Goods Receiving, Valuation, and Notification endpoints (`/api/warehouses/*`, `/api/warehouse/*`, `/api/inventory/*`) are documented in detail in:
+
+- [`docs/WMS_API_SPECIFICATION.md`](./WMS_API_SPECIFICATION.md)

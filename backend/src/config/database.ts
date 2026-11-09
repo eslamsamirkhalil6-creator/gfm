@@ -1,8 +1,13 @@
-import fs from 'fs';
-import path from 'path';
 import pg from 'pg';
-import { newDb } from 'pg-mem';
+import type { newDb } from 'pg-mem';
 import { env } from './env.ts';
+import {
+  attachPgMemImmutabilityGuards,
+  createConfiguredPgMemDb,
+  createPgDriver,
+  createPgMemDriver,
+  runPendingMigrations,
+} from './migrations.ts';
 
 const { Pool } = pg;
 
@@ -40,23 +45,13 @@ let currentMode: DatabaseMode = 'PostgreSQL (In-Memory Engine)';
 let isInitialized = false;
 
 /**
- * Initialize PostgreSQL connection or in-memory fallback.
+ * Initialize PostgreSQL connection or in-memory fallback with tracked migrations.
  */
 export async function initDatabase(): Promise<void> {
   if (isInitialized) return;
 
-  const migrationsDir = path.resolve(process.cwd(), 'database/migrations');
-  const seedsDir = path.resolve(process.cwd(), 'database/seeds');
-
-  const migrationFiles = fs.existsSync(migrationsDir)
-    ? fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort()
-    : [];
-
-  const seedFiles = fs.existsSync(seedsDir)
-    ? fs.readdirSync(seedsDir).filter(f => f.endsWith('.sql')).sort()
-    : [];
-
   if (env.DATABASE_URL && env.DATABASE_URL.trim() !== '') {
+    let connectedPool: pg.Pool | null = null;
     try {
       console.log('[DB] Connecting to live PostgreSQL at:', env.DATABASE_URL.replace(/:[^:]*@/, ':****@'));
       const pool = new Pool({
@@ -65,111 +60,40 @@ export async function initDatabase(): Promise<void> {
         connectionTimeoutMillis: 5000,
       });
 
-      // Test connection
+      // Test network/TCP connectivity only
       await pool.query('SELECT 1 as ping');
-      activePool = pool;
-      currentMode = 'PostgreSQL (Live Connection)';
-      console.log('[DB] Connected to Live PostgreSQL successfully.');
-
-      // Check if tables exist, run migrations if needed
-      const checkTables = await pool.query(
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users'"
-      );
-      if (parseInt(checkTables.rows[0].count, 10) === 0) {
-        console.log('[DB] Running incremental migrations on live PostgreSQL...');
-        for (const file of migrationFiles) {
-          console.log(`[DB] Applying migration: ${file}`);
-          const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-          await pool.query(sql);
-        }
-        for (const file of seedFiles) {
-          console.log(`[DB] Applying seed: ${file}`);
-          const sql = fs.readFileSync(path.join(seedsDir, file), 'utf8');
-          await pool.query(sql);
-        }
-        console.log('[DB] Live PostgreSQL migrations and seeds completed.');
-      } else {
-        // Run any subsequent migrations (e.g. 002_) if production_halls table doesn't exist
-        const checkProduction = await pool.query(
-          "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'production_halls'"
-        );
-        if (parseInt(checkProduction.rows[0].count, 10) === 0) {
-          console.log('[DB] Applying Part 2 Production Module migrations...');
-          for (const file of migrationFiles.filter(f => !f.startsWith('001_'))) {
-            console.log(`[DB] Applying incremental migration: ${file}`);
-            const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-            await pool.query(sql);
-          }
-          for (const file of seedFiles.filter(f => !f.startsWith('001_'))) {
-            console.log(`[DB] Applying incremental seed: ${file}`);
-            const sql = fs.readFileSync(path.join(seedsDir, file), 'utf8');
-            await pool.query(sql);
-          }
-        }
-      }
-
-      // Check if Part 4 Department Manager role exists
-      const checkDeptManager = await pool.query(
-        "SELECT count(*) FROM roles WHERE role_name = 'Department Manager'"
-      );
-      if (parseInt(checkDeptManager.rows[0].count, 10) === 0) {
-        console.log('[DB] Applying Part 4 Department Manager migrations & seeds...');
-        for (const file of migrationFiles.filter(f => f.startsWith('004_'))) {
-          const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-          await pool.query(sql);
-        }
-        for (const file of seedFiles.filter(f => f.startsWith('004_'))) {
-          const sql = fs.readFileSync(path.join(seedsDir, file), 'utf8');
-          await pool.query(sql);
-        }
-      }
-
-      isInitialized = true;
-      return;
+      connectedPool = pool;
     } catch (err: any) {
       console.log('[DB] Live PostgreSQL unavailable (' + err.message + '). Active engine: PostgreSQL In-Memory Engine (pg-mem).');
+    }
+
+    if (connectedPool) {
+      activePool = connectedPool;
+      currentMode = 'PostgreSQL (Live Connection)';
+      console.log('[DB] Connected to Live PostgreSQL successfully. Running tracked migrations...');
+      // Migration failures MUST surface loudly and never be swallowed into pg-mem fallback
+      const report = await runPendingMigrations(createPgDriver(connectedPool));
+      console.log(
+        `[DB] Live PostgreSQL migrations complete (applied: ${report.appliedMigrations.length} migrations, ${report.appliedSeeds.length} seeds; skipped: ${report.skippedMigrations.length} migrations).`
+      );
+      isInitialized = true;
+      return;
     }
   }
 
   // Fallback or preview mode: pg-mem
-  console.log('[DB] Initializing PostgreSQL In-Memory Engine with all DDL migrations and seed data...');
-  const memDb = newDb({
-    autoCreateForeignKeyIndices: true,
-  });
-
-  // Mock standard PostgreSQL helper functions
-  (memDb.public as any).registerFunction({
-    name: 'setval',
-    args: ['text', 'integer'],
-    returns: 'integer',
-    implementation: (_seq: string, val: number) => val,
-  });
-
-  (memDb.public as any).registerFunction({
-    name: 'pg_get_serial_sequence',
-    args: ['text', 'text'],
-    returns: 'text',
-    implementation: (table: string, column: string) => `${table}_${column}_seq`,
-  });
-
-  // Apply all migrations in order
-  for (const file of migrationFiles) {
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-    memDb.public.none(sql);
-  }
-
-  // Apply all seeds in order
-  for (const file of seedFiles) {
-    const sql = fs.readFileSync(path.join(seedsDir, file), 'utf8');
-    memDb.public.none(sql);
-  }
+  console.log('[DB] Initializing PostgreSQL In-Memory Engine with tracked DDL migrations and seed data...');
+  const memDb = createConfiguredPgMemDb();
+  const report = await runPendingMigrations(createPgMemDriver(memDb));
 
   const pgAdapter = memDb.adapters.createPg();
   memoryDbInstance = memDb;
   memoryDbPool = new pgAdapter.Pool();
   currentMode = 'PostgreSQL (In-Memory Engine)';
   isInitialized = true;
-  console.log('[DB] PostgreSQL In-Memory Engine initialized and seeded successfully with all modules.');
+  console.log(
+    `[DB] PostgreSQL In-Memory Engine initialized (applied: ${report.appliedMigrations.length} migrations, ${report.appliedSeeds.length} seeds).`
+  );
 }
 
 /**
@@ -253,6 +177,7 @@ export async function withTransaction<T>(fn: (txQuery: QueryFn) => Promise<T>): 
       return await fn(query);
     } catch (err) {
       snapshot.restore();
+      attachPgMemImmutabilityGuards(memDb);
       throw err;
     } finally {
       releaseLock();

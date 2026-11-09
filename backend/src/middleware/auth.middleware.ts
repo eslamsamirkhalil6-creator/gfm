@@ -12,6 +12,8 @@ export interface AuthenticatedUser {
   permissions: string[];
   managed_department_ids: number[];
   primary_department_id: number | null;
+  managed_warehouse_ids: number[];
+  supervised_line_ids: number[];
 }
 
 declare global {
@@ -111,6 +113,31 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
     const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
     const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
 
+    // Fetch warehouses authoritatively assigned to this user (active warehouse_staff or manager_id)
+    const [whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+      query<{ warehouse_id: number }>(
+        `SELECT warehouse_id FROM warehouse_staff
+         WHERE user_id = $1 AND status = 'active'
+           AND effective_from <= CURRENT_DATE
+           AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)`,
+        [user.id]
+      ),
+      query<{ id: number }>(
+        `SELECT id FROM warehouses WHERE manager_id = $1 AND status = 'active'`,
+        [user.id]
+      ),
+      query<{ id: number }>(
+        `SELECT id FROM production_lines WHERE supervisor_id = $1 ORDER BY id ASC`,
+        [user.id]
+      ),
+    ]);
+
+    const warehouseIdSet = new Set<number>();
+    for (const r of whStaffRes.rows) warehouseIdSet.add(r.warehouse_id);
+    for (const r of whMgrRes.rows) warehouseIdSet.add(r.id);
+    const managed_warehouse_ids = Array.from(warehouseIdSet).sort((a, b) => a - b);
+    const supervised_line_ids = supLinesRes.rows.map(r => r.id);
+
     req.user = {
       id: user.id,
       username: user.username,
@@ -120,6 +147,8 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       permissions: permRes.rows.map(p => p.permission_key),
       managed_department_ids,
       primary_department_id,
+      managed_warehouse_ids,
+      supervised_line_ids,
     };
 
     next();
@@ -167,6 +196,37 @@ export function requirePermission(...requiredPermissions: string[]) {
         error: {
           code: 'FORBIDDEN',
           message: `Access denied. Missing required permission(s): ${requiredPermissions.join(', ')}`,
+        },
+      });
+      return;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Middleware factory requiring at least one of the specified permissions.
+ */
+export function requireAnyPermission(...allowedPermissions: string[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      });
+      return;
+    }
+
+    const userPermissions = new Set(req.user.permissions);
+    const hasAny = allowedPermissions.some(p => userPermissions.has(p));
+
+    if (!hasAny) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: `Access denied. Requires one of permission(s): ${allowedPermissions.join(', ')}`,
         },
       });
       return;
@@ -411,5 +471,234 @@ export async function requireDepartmentTargetScope(
     next(err);
   }
 }
+
+export const GLOBAL_WAREHOUSE_ROLES = new Set([
+  'System Administrator',
+  'Factory Manager',
+  'Production Manager',
+  'Purchasing Manager',
+  'Finance Viewer',
+  'QC Manager',
+  'QC Inspector',
+]);
+
+export function hasGlobalWarehouseAccess(user: AuthenticatedUser): boolean {
+  return user.roles.some((r) => GLOBAL_WAREHOUSE_ROLES.has(r));
+}
+
+/**
+ * Middleware enforcing warehouse-level scope based on warehouse_staff / warehouses.manager_id.
+ * Global roles (System Administrator, Factory Manager, etc.) pass across warehouses if they hold the route's permission.
+ * Warehouse-scoped roles (Warehouse Manager, Warehouse Keeper, or custom scoped roles) are strictly restricted
+ * to req.user.managed_warehouse_ids and denied by default when scope cannot be established.
+ */
+export function requireWarehouseScope(
+  options: {
+    paramKey?: string;
+    bodyKey?: string;
+    queryKey?: string;
+    optional?: boolean;
+  } = {}
+) {
+  const paramKey = options.paramKey || 'warehouseId';
+  const bodyKey = options.bodyKey || 'warehouse_id';
+  const queryKey = options.queryKey || 'warehouse_id';
+
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      });
+      return;
+    }
+
+    const rawWhId =
+      req.params?.[paramKey] ??
+      (paramKey === 'warehouseId' ? undefined : req.params?.id) ??
+      req.body?.[bodyKey] ??
+      req.query?.[queryKey];
+
+    if (rawWhId === undefined || rawWhId === null || rawWhId === '') {
+      if (options.optional) {
+        return next();
+      }
+      res.status(400).json({
+        success: false,
+        error: { code: 'BAD_REQUEST', message: 'Valid warehouse_id is required' },
+      });
+      return;
+    }
+
+    const warehouseId = parseInt(String(rawWhId), 10);
+    if (isNaN(warehouseId) || warehouseId <= 0) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'BAD_REQUEST', message: 'Valid positive warehouse_id is required' },
+      });
+      return;
+    }
+
+    if (hasGlobalWarehouseAccess(req.user)) {
+      return next();
+    }
+
+    // Deny access by default if user is not assigned to the target warehouse
+    if (!req.user.managed_warehouse_ids.includes(warehouseId)) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: `Access denied. You are not assigned to Warehouse #${warehouseId}.`,
+        },
+      });
+      return;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Middleware enforcing production-line & department scope on production-facing warehouse endpoints
+ * (requisitions, returns, FG receipts).
+ * - Factory Manager, Production Manager, and System Administrator have global scope (subject to route permissions).
+ * - Department Managers are scoped to lines within req.user.managed_department_ids.
+ * - Production Line Responsible Persons (production_lines.supervisor_id = req.user.id) are strictly scoped
+ *   to req.user.supervised_line_ids and rejected if trying to access/submit for unassigned lines or omit line scope.
+ */
+export function requireProductionLineScope(
+  options: {
+    requireLineWhenSupervisorOnly?: boolean;
+  } = {}
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      });
+      return;
+    }
+
+    const isGlobalScope =
+      req.user.roles.includes('Factory Manager') ||
+      req.user.roles.includes('Production Manager') ||
+      req.user.roles.includes('System Administrator');
+
+    const rawDeptId = req.body?.department_id ?? req.query?.department_id;
+    const rawLineId = req.body?.production_line_id ?? req.query?.production_line_id;
+
+    const deptId = rawDeptId !== undefined && rawDeptId !== '' ? parseInt(String(rawDeptId), 10) : null;
+    const lineId = rawLineId !== undefined && rawLineId !== '' ? parseInt(String(rawLineId), 10) : null;
+
+    if (rawDeptId !== undefined && rawDeptId !== '' && (isNaN(deptId as number) || (deptId as number) <= 0)) {
+      res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'Invalid department_id' } });
+      return;
+    }
+    if (rawLineId !== undefined && rawLineId !== '' && (isNaN(lineId as number) || (lineId as number) <= 0)) {
+      res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'Invalid production_line_id' } });
+      return;
+    }
+
+    try {
+      let lineDeptId: number | null = null;
+      if (lineId !== null) {
+        const lineRes = await query<{ id: number; department_id: number | null; supervisor_id: number | null }>(
+          `SELECT id, department_id, supervisor_id FROM production_lines WHERE id = $1`,
+          [lineId]
+        );
+        if (lineRes.rowCount === 0) {
+          res.status(404).json({
+            success: false,
+            error: { code: 'NOT_FOUND', message: `Production Line #${lineId} not found` },
+          });
+          return;
+        }
+        lineDeptId = lineRes.rows[0].department_id;
+
+        if (deptId !== null && lineDeptId !== null && lineDeptId !== deptId) {
+          res.status(400).json({
+            success: false,
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: `Production Line #${lineId} belongs to Department #${lineDeptId}, not Department #${deptId}.`,
+            },
+          });
+          return;
+        }
+      }
+
+      if (isGlobalScope) {
+        return next();
+      }
+
+      // Check Department Manager authority
+      const isDeptMgr = req.user.managed_department_ids.length > 0;
+      const isLineSupervisor = req.user.supervised_line_ids.length > 0;
+
+      if (!isDeptMgr && !isLineSupervisor) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Access denied. No managed department or supervised production line scope established.',
+          },
+        });
+        return;
+      }
+
+      // Check Department access when deptId is given
+      if (deptId !== null) {
+        const deptAuthorizedByMgmt = req.user.managed_department_ids.includes(deptId);
+        const deptAuthorizedByLine =
+          lineId !== null &&
+          req.user.supervised_line_ids.includes(lineId) &&
+          lineDeptId === deptId;
+
+        if (!deptAuthorizedByMgmt && !deptAuthorizedByLine) {
+          res.status(403).json({
+            success: false,
+            error: {
+              code: 'FORBIDDEN',
+              message: `Access denied. Department #${deptId} is outside your assigned department/line scope.`,
+            },
+          });
+          return;
+        }
+      }
+
+      // Check Line access when lineId is given
+      if (lineId !== null) {
+        const lineInManagedDept = lineDeptId !== null && req.user.managed_department_ids.includes(lineDeptId);
+        const lineSupervised = req.user.supervised_line_ids.includes(lineId);
+        if (!lineInManagedDept && !lineSupervised) {
+          res.status(403).json({
+            success: false,
+            error: {
+              code: 'FORBIDDEN',
+              message: `Access denied. Production Line #${lineId} is outside your supervised scope.`,
+            },
+          });
+          return;
+        }
+      } else if (options.requireLineWhenSupervisorOnly && !isDeptMgr && isLineSupervisor) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Production line supervisors must specify their assigned production_line_id.',
+          },
+        });
+        return;
+      }
+
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
 
 
