@@ -22,7 +22,7 @@ import {
   DepartmentWithDetails,
   DepartmentEmployee,
   DepartmentProductionLine,
-  UserItem,
+  AssignableUser,
 } from '../types/index.ts';
 import { AssignEmployeeModal } from './departments/AssignEmployeeModal.tsx';
 import { DepartmentFormModal } from './departments/DepartmentFormModal.tsx';
@@ -40,10 +40,11 @@ export const MyDepartmentPage: React.FC = () => {
     sub_departments: DepartmentWithDetails[];
     employees: DepartmentEmployee[];
     manager_history: any[];
+    production_lines: DepartmentProductionLine[];
   } | null>(null);
 
   const [allDepartments, setAllDepartments] = useState<DepartmentWithDetails[]>([]);
-  const [usersList, setUsersList] = useState<UserItem[]>([]);
+  const [usersList, setUsersList] = useState<AssignableUser[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -74,7 +75,7 @@ export const MyDepartmentPage: React.FC = () => {
       const [deptDetail, depts, users] = await Promise.all([
         ApiService.getDepartmentById(selectedDeptId),
         ApiService.getDepartments().catch(() => []),
-        ApiService.getUsers().catch(() => []),
+        ApiService.getDepartmentAssignableUsers(selectedDeptId),
       ]);
 
       setDepartmentData(deptDetail);
@@ -125,7 +126,7 @@ export const MyDepartmentPage: React.FC = () => {
 
   const dept = departmentData?.department;
   const employees = departmentData?.employees || [];
-  const lines: DepartmentProductionLine[] = dept?.production_lines || [];
+  const lines: DepartmentProductionLine[] = departmentData?.production_lines || [];
   const primaryEmployees = employees.filter((e) => e.is_primary);
   const secondaryEmployees = employees.filter((e) => !e.is_primary);
 

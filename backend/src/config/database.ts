@@ -26,12 +26,16 @@ export interface DatabaseStatus {
   error?: string;
 }
 
+export type QueryFn = <T = any>(sql: string, params?: any[]) => Promise<QueryResult<T>>;
+
 interface DbClient {
   query: <T = any>(text: string, params?: any[]) => Promise<QueryResult<T>>;
 }
 
 let activePool: pg.Pool | null = null;
 let memoryDbPool: any = null;
+let memoryDbInstance: ReturnType<typeof newDb> | null = null;
+let memoryTxQueue: Promise<void> = Promise.resolve();
 let currentMode: DatabaseMode = 'PostgreSQL (In-Memory Engine)';
 let isInitialized = false;
 
@@ -161,6 +165,7 @@ export async function initDatabase(): Promise<void> {
   }
 
   const pgAdapter = memDb.adapters.createPg();
+  memoryDbInstance = memDb;
   memoryDbPool = new pgAdapter.Pool();
   currentMode = 'PostgreSQL (In-Memory Engine)';
   isInitialized = true;
@@ -190,6 +195,71 @@ export async function query<T = any>(sql: string, params: any[] = []): Promise<Q
     console.error(`[DB Query Error] Query: "${sql.slice(0, 100)}..." Message: ${err.message}`);
     throw err;
   }
+}
+
+/**
+ * Execute a callback inside an atomic database transaction.
+ * - On live PostgreSQL: uses a dedicated pool client with BEGIN / COMMIT / ROLLBACK.
+ * - On pg-mem fallback: serializes execution and restores a backup snapshot on error.
+ */
+export async function withTransaction<T>(fn: (txQuery: QueryFn) => Promise<T>): Promise<T> {
+  if (!isInitialized) {
+    await initDatabase();
+  }
+
+  if (activePool) {
+    const client = await activePool.connect();
+    const txQuery: QueryFn = async <R = any>(sql: string, params: any[] = []): Promise<QueryResult<R>> => {
+      try {
+        const res = await client.query(sql, params);
+        return {
+          rows: res.rows || [],
+          rowCount: res.rowCount !== undefined && res.rowCount !== null ? res.rowCount : (res.rows ? res.rows.length : 0),
+        };
+      } catch (err: any) {
+        console.error(`[DB TX Query Error] Query: "${sql.slice(0, 100)}..." Message: ${err.message}`);
+        throw err;
+      }
+    };
+
+    try {
+      await client.query('BEGIN');
+      const result = await fn(txQuery);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr: any) {
+        console.error('[DB TX Rollback Error]:', rollbackErr?.message || rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  if (memoryDbInstance) {
+    const memDb = memoryDbInstance;
+    let releaseLock!: () => void;
+    const prev = memoryTxQueue;
+    memoryTxQueue = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    await prev;
+    const snapshot = memDb.backup();
+    try {
+      return await fn(query);
+    } catch (err) {
+      snapshot.restore();
+      throw err;
+    } finally {
+      releaseLock();
+    }
+  }
+
+  throw new Error('Database is not initialized.');
 }
 
 /**

@@ -335,3 +335,81 @@ export function requireDepartmentListAccess(req: Request, res: Response, next: N
   });
 }
 
+/**
+ * Middleware enforcing target department authorization for cross-department employee transfers.
+ * Global managers (departments:manage_employees) are allowed globally.
+ * Department Managers must authoritatively manage the target department as well as the source department.
+ */
+export async function requireDepartmentTargetScope(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  if (!req.user) {
+    res.status(401).json({
+      success: false,
+      error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+    });
+    return;
+  }
+
+  if (req.user.permissions.includes('departments:manage_employees')) {
+    return next();
+  }
+
+  const isDeptManager =
+    req.user.roles.includes('Department Manager') ||
+    req.user.permissions.includes('departments:scoped:manage');
+
+  if (!isDeptManager) {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'FORBIDDEN',
+        message: 'Access denied. Missing required permission: departments:manage_employees',
+      },
+    });
+    return;
+  }
+
+  const targetDeptId = parseInt(String(req.body?.target_department_id), 10);
+  if (isNaN(targetDeptId)) {
+    res.status(400).json({
+      success: false,
+      error: { code: 'BAD_REQUEST', message: 'Valid target department ID is required' },
+    });
+    return;
+  }
+
+  try {
+    const deptRes = await query<{ id: number; manager_id: number | null }>(
+      'SELECT id, manager_id FROM departments WHERE id = $1',
+      [targetDeptId]
+    );
+
+    if (deptRes.rowCount === 0) {
+      res.status(404).json({
+        success: false,
+        error: { code: 'NOT_FOUND', message: `Target Department #${targetDeptId} not found` },
+      });
+      return;
+    }
+
+    if (deptRes.rows[0].manager_id !== req.user.id) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: `Access denied. You are not authorized to transfer employees into Department #${targetDeptId}.`,
+        },
+      });
+      return;
+    }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+

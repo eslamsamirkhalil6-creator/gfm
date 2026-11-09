@@ -1,16 +1,16 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, UserPlus, ArrowRightLeft, AlertCircle, Save } from 'lucide-react';
 import { ApiService } from '../../services/api.ts';
 import {
   DepartmentWithDetails,
   DepartmentEmployee,
-  UserItem,
+  AssignableUser,
 } from '../../types/index.ts';
 
 interface AssignEmployeeModalProps {
   department: DepartmentWithDetails;
   departments: DepartmentWithDetails[];
-  users: UserItem[];
+  users: AssignableUser[];
   transferEmployee?: DepartmentEmployee | null;
   onClose: () => void;
   onSuccess: () => void;
@@ -42,6 +42,12 @@ export const AssignEmployeeModal: React.FC<AssignEmployeeModalProps> = ({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isTransfer && users.length > 0 && !users.some((u) => u.id === userId)) {
+      setUserId(users[0].id);
+    }
+  }, [isTransfer, users, userId]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

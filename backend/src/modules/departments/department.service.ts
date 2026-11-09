@@ -1,4 +1,4 @@
-import { query, QueryResult } from '../../config/database.ts';
+import { query, QueryFn, QueryResult, withTransaction } from '../../config/database.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import {
   Department,
@@ -80,9 +80,10 @@ export class DepartmentService {
     const params: any[] = [];
     let paramIndex = 1;
 
-    // Scoped filtering: if not a global viewer, only return departments managed by this user
+    // Scoped filtering: if not a global viewer, only return departments managed by this user.
+    // Using `+ 0` avoids pg-mem's `NotSupported: lookups on joins` on indexed FK columns while remaining standard PostgreSQL SQL.
     if (!isGlobalViewer && actorUserId !== undefined) {
-      sql += ` AND d.manager_id = $${paramIndex++}`;
+      sql += ` AND d.manager_id + 0 = $${paramIndex++}`;
       params.push(actorUserId);
     }
 
@@ -315,6 +316,39 @@ export class DepartmentService {
       `,
       [deptId]
     );
+    return res.rows;
+  }
+
+  /**
+   * Return active minimal user records eligible for assignment within an authorized department.
+   */
+  static async getAssignableUsers(deptId: number): Promise<
+    Array<{
+      id: number;
+      username: string;
+      full_name: string;
+      is_active: boolean;
+    }>
+  > {
+    const deptCheck = await query('SELECT id FROM departments WHERE id = $1', [deptId]);
+    if (deptCheck.rows.length === 0) {
+      const err: any = new Error(`Department with ID ${deptId} not found.`);
+      err.statusCode = 404;
+      throw err;
+    }
+
+    const res = await query<{
+      id: number;
+      username: string;
+      full_name: string;
+      is_active: boolean;
+    }>(
+      `SELECT id, username, full_name, is_active
+       FROM users
+       WHERE is_active = TRUE
+       ORDER BY full_name ASC, id ASC`
+    );
+
     return res.rows;
   }
 
@@ -667,18 +701,23 @@ export class DepartmentService {
     deptId: number,
     dto: AssignEmployeeDTO,
     actorId: number,
-    ipAddress?: string
+    ipAddress?: string,
+    txQuery: QueryFn = query
   ): Promise<DepartmentEmployee> {
     const [deptRes, userRes] = await Promise.all([
-      query('SELECT id, name FROM departments WHERE id = $1', [deptId]),
-      query('SELECT id, full_name, username FROM users WHERE id = $1', [dto.user_id]),
+      txQuery('SELECT id, name FROM departments WHERE id = $1', [deptId]),
+      txQuery('SELECT id, full_name, username FROM users WHERE id = $1', [dto.user_id]),
     ]);
 
     if (deptRes.rows.length === 0) {
-      throw new Error(`Department with ID ${deptId} not found.`);
+      const err: any = new Error(`Department with ID ${deptId} not found.`);
+      err.statusCode = 404;
+      throw err;
     }
     if (userRes.rows.length === 0) {
-      throw new Error(`User with ID ${dto.user_id} not found.`);
+      const err: any = new Error(`User with ID ${dto.user_id} not found.`);
+      err.statusCode = 404;
+      throw err;
     }
 
     const dept = deptRes.rows[0];
@@ -688,11 +727,11 @@ export class DepartmentService {
 
     // If marked primary, unset primary on other assignments for this user if specified
     if (isPrimary) {
-      await query('UPDATE department_employees SET is_primary = FALSE WHERE user_id = $1', [dto.user_id]);
+      await txQuery('UPDATE department_employees SET is_primary = FALSE WHERE user_id = $1', [dto.user_id]);
     }
 
     // Upsert into department_employees
-    await query(
+    await txQuery(
       `
       INSERT INTO department_employees (department_id, user_id, position_title, is_primary, notes)
       VALUES ($1, $2, $3, $4, $5)
@@ -702,16 +741,19 @@ export class DepartmentService {
       [deptId, dto.user_id, pos, isPrimary, dto.notes?.trim() || null]
     );
 
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_EMPLOYEE_ASSIGN',
-      entityType: 'DEPARTMENT',
-      entityId: String(deptId),
-      details: `Assigned user @${user.username} (${user.full_name}) as "${pos}" in department "${dept.name}" (Primary: ${isPrimary})`,
-      ipAddress,
-    });
+    await AuditService.log(
+      {
+        userId: actorId,
+        action: 'DEPT_EMPLOYEE_ASSIGN',
+        entityType: 'DEPARTMENT',
+        entityId: String(deptId),
+        details: `Assigned user @${user.username} (${user.full_name}) as "${pos}" in department "${dept.name}" (Primary: ${isPrimary})`,
+        ipAddress,
+      },
+      txQuery
+    );
 
-    const empRes = await query(
+    const empRes = await txQuery(
       `
       SELECT 
         de.id, de.department_id, de.user_id, de.position_title, de.is_primary, de.assigned_at, de.notes,
@@ -727,7 +769,8 @@ export class DepartmentService {
   }
 
   /**
-   * Transfer an employee from one department to another
+   * Transfer an employee from one department to another inside an atomic transaction.
+   * Enforces authorization on BOTH source and target departments for non-global managers.
    */
   static async transferEmployee(
     sourceDeptId: number,
@@ -736,48 +779,93 @@ export class DepartmentService {
     newPosition: string,
     isPrimary: boolean,
     actorId: number,
-    ipAddress?: string
+    ipAddress?: string,
+    actorPermissions?: string[]
   ): Promise<DepartmentEmployee> {
     if (sourceDeptId === targetDeptId) {
-      throw new Error('Source and target departments must be different for transfer.');
+      const err: any = new Error('Source and target departments must be different for transfer.');
+      err.statusCode = 400;
+      throw err;
     }
 
     const [srcRes, tgtRes, userRes] = await Promise.all([
-      query('SELECT id, name FROM departments WHERE id = $1', [sourceDeptId]),
-      query('SELECT id, name FROM departments WHERE id = $1', [targetDeptId]),
-      query('SELECT id, username, full_name FROM users WHERE id = $1', [userId]),
+      query<{ id: number; name: string; manager_id: number | null }>(
+        'SELECT id, name, manager_id FROM departments WHERE id = $1',
+        [sourceDeptId]
+      ),
+      query<{ id: number; name: string; manager_id: number | null }>(
+        'SELECT id, name, manager_id FROM departments WHERE id = $1',
+        [targetDeptId]
+      ),
+      query<{ id: number; username: string; full_name: string }>(
+        'SELECT id, username, full_name FROM users WHERE id = $1',
+        [userId]
+      ),
     ]);
 
     if (srcRes.rows.length === 0 || tgtRes.rows.length === 0 || userRes.rows.length === 0) {
-      throw new Error('Invalid source department, target department, or user ID.');
+      const err: any = new Error('Invalid source department, target department, or user ID.');
+      err.statusCode = 404;
+      throw err;
     }
 
-    // Delete from source department
-    await query('DELETE FROM department_employees WHERE department_id = $1 AND user_id = $2', [sourceDeptId, userId]);
+    const srcDept = srcRes.rows[0];
+    const tgtDept = tgtRes.rows[0];
 
-    // Assign to target department
-    const assigned = await this.assignEmployee(
-      targetDeptId,
-      {
-        user_id: userId,
-        position_title: newPosition,
-        is_primary: isPrimary,
-        notes: `Transferred from ${srcRes.rows[0].name}`,
-      },
-      actorId,
-      ipAddress
-    );
+    // Defense-in-depth service authorization check for BOTH source and target departments
+    if (actorPermissions !== undefined && !actorPermissions.includes('departments:manage_employees')) {
+      if (!actorPermissions.includes('departments:scoped:manage')) {
+        const err: any = new Error('Transferring employees requires department management permissions.');
+        err.statusCode = 403;
+        err.code = 'FORBIDDEN';
+        throw err;
+      }
 
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_EMPLOYEE_TRANSFER',
-      entityType: 'DEPARTMENT',
-      entityId: String(targetDeptId),
-      details: `Transferred user @${userRes.rows[0].username} from department "${srcRes.rows[0].name}" to "${tgtRes.rows[0].name}" as "${newPosition}"`,
-      ipAddress,
+      if (srcDept.manager_id !== actorId || tgtDept.manager_id !== actorId) {
+        const err: any = new Error(
+          'Access denied. Department Managers may only transfer employees between departments they are authorized to manage.'
+        );
+        err.statusCode = 403;
+        err.code = 'FORBIDDEN';
+        throw err;
+      }
+    }
+
+    return withTransaction(async (txQuery) => {
+      // Delete from source department
+      await txQuery('DELETE FROM department_employees WHERE department_id = $1 AND user_id = $2', [
+        sourceDeptId,
+        userId,
+      ]);
+
+      // Assign to target department inside the same transaction
+      const assigned = await this.assignEmployee(
+        targetDeptId,
+        {
+          user_id: userId,
+          position_title: newPosition,
+          is_primary: isPrimary,
+          notes: `Transferred from ${srcDept.name}`,
+        },
+        actorId,
+        ipAddress,
+        txQuery
+      );
+
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_EMPLOYEE_TRANSFER',
+          entityType: 'DEPARTMENT',
+          entityId: String(targetDeptId),
+          details: `Transferred user @${userRes.rows[0].username} from department "${srcDept.name}" to "${tgtDept.name}" as "${newPosition}"`,
+          ipAddress,
+        },
+        txQuery
+      );
+
+      return assigned;
     });
-
-    return assigned;
   }
 
   /**

@@ -75,6 +75,21 @@ export class DepartmentController {
     }
   }
 
+  static async getAssignableUsers(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const deptId = parseInt(req.params.id, 10);
+      if (isNaN(deptId)) {
+        res.status(400).json({ success: false, message: 'Invalid department ID.' });
+        return;
+      }
+
+      const users = await DepartmentService.getAssignableUsers(deptId);
+      res.status(200).json({ success: true, data: users });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   static async createDepartment(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actorId = (req as any).user?.id || 1;
@@ -198,6 +213,7 @@ export class DepartmentController {
 
       const actorId = (req as any).user?.id || 1;
       const ipAddress = req.ip;
+      const actorPermissions = req.user?.permissions || [];
 
       const transferred = await DepartmentService.transferEmployee(
         sourceDeptId,
@@ -206,7 +222,8 @@ export class DepartmentController {
         position_title || 'Staff',
         is_primary !== undefined ? Boolean(is_primary) : true,
         actorId,
-        ipAddress
+        ipAddress,
+        actorPermissions
       );
 
       res.status(200).json({

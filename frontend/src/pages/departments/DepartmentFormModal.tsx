@@ -5,14 +5,14 @@ import {
   DepartmentWithDetails,
   CreateDepartmentDTO,
   UpdateDepartmentDTO,
-  UserItem,
+  AssignableUser,
 } from '../../types/index.ts';
 
 interface DepartmentFormModalProps {
   initialDept?: DepartmentWithDetails | null;
   defaultParentId?: number | null;
   departments: DepartmentWithDetails[];
-  users: UserItem[];
+  users: AssignableUser[];
   canManageManager?: boolean;
   canManageHierarchy?: boolean;
   onClose: () => void;
@@ -66,8 +66,8 @@ export const DepartmentFormModal: React.FC<DepartmentFormModalProps> = ({
         const updatePayload: UpdateDepartmentDTO = {
           name: name.trim(),
           description: description.trim() || undefined,
-          parent_id: parentId,
-          manager_id: managerId,
+          ...(canManageHierarchy ? { parent_id: parentId } : {}),
+          ...(canManageManager ? { manager_id: managerId } : {}),
         };
         await ApiService.updateDepartment(initialDept.id, updatePayload);
       } else {

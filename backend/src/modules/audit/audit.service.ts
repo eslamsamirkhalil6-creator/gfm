@@ -1,4 +1,4 @@
-import { query } from '../../config/database.ts';
+import { query, QueryFn } from '../../config/database.ts';
 
 export interface AuditRecord {
   id: number;
@@ -16,14 +16,17 @@ export class AuditService {
   /**
    * Log an audit event. Immutable and append-only.
    */
-  static async log(params: {
-    userId?: number | null;
-    action: string;
-    entityType: string;
-    entityId?: string | number | null;
-    details?: string | Record<string, any> | null;
-    ipAddress?: string | null;
-  }): Promise<AuditRecord> {
+  static async log(
+    params: {
+      userId?: number | null;
+      action: string;
+      entityType: string;
+      entityId?: string | number | null;
+      details?: string | Record<string, any> | null;
+      ipAddress?: string | null;
+    },
+    queryFn: QueryFn = query
+  ): Promise<AuditRecord> {
     const detailsStr = typeof params.details === 'object' && params.details !== null
       ? JSON.stringify(params.details)
       : (params.details || null);
@@ -32,7 +35,7 @@ export class AuditService {
       ? String(params.entityId)
       : null;
 
-    const res = await query<AuditRecord>(
+    const res = await queryFn<AuditRecord>(
       `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, ip_address, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
        RETURNING *`,

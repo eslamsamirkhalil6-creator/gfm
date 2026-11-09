@@ -9,6 +9,13 @@ export interface CurrentUser {
   primary_department_id: number | null;
 }
 
+export interface AssignableUser {
+  id: number;
+  username: string;
+  full_name: string;
+  is_active: boolean;
+}
+
 export interface UserItem {
   id: number;
   username: string;

@@ -49,6 +49,7 @@ export const DepartmentDetailModal: React.FC<DepartmentDetailModalProps> = ({
     sub_departments: DepartmentWithDetails[];
     employees: DepartmentEmployee[];
     manager_history: DepartmentManagerHistoryItem[];
+    production_lines: DepartmentProductionLine[];
   } | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -213,13 +214,13 @@ export const DepartmentDetailModal: React.FC<DepartmentDetailModalProps> = ({
             <div className="flex items-center space-x-2">
               <Layers className="w-4 h-4 text-emerald-400" />
               <h3 className="text-xs font-bold text-white">
-                Linked Production Lines ({details?.department?.production_lines?.length || 0})
+                Linked Production Lines ({details?.production_lines?.length || 0})
               </h3>
             </div>
 
-            {details?.department?.production_lines && details.department.production_lines.length > 0 ? (
+            {details?.production_lines && details.production_lines.length > 0 ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                {details.department.production_lines.map((line: DepartmentProductionLine) => (
+                {details.production_lines.map((line: DepartmentProductionLine) => (
                   <div
                     key={line.id}
                     className="p-3 bg-slate-950/70 border border-slate-800 rounded-lg flex flex-col justify-between"

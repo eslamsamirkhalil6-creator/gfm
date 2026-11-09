@@ -5,6 +5,7 @@ import {
   RoleItem,
   TestSuiteResult,
   UserItem,
+  AssignableUser,
   DepartmentWithDetails,
   DepartmentTreeNode,
   DepartmentStats,
@@ -464,6 +465,7 @@ export class ApiService {
     sub_departments: DepartmentWithDetails[];
     employees: DepartmentEmployee[];
     manager_history: DepartmentManagerHistoryItem[];
+    production_lines: DepartmentProductionLine[];
   }> {
     const res = await fetch(`/api/departments/${id}`, { headers: this.getHeaders() });
     const result = await this.handleResponse<{
@@ -473,6 +475,7 @@ export class ApiService {
         sub_departments: DepartmentWithDetails[];
         employees: DepartmentEmployee[];
         manager_history: DepartmentManagerHistoryItem[];
+        production_lines: DepartmentProductionLine[];
       };
     }>(res);
     return result.data;
@@ -483,6 +486,15 @@ export class ApiService {
     const result = await this.handleResponse<{
       success: boolean;
       data: DepartmentProductionLine[];
+    }>(res);
+    return result.data;
+  }
+
+  static async getDepartmentAssignableUsers(deptId: number): Promise<AssignableUser[]> {
+    const res = await fetch(`/api/departments/${deptId}/assignable-users`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: AssignableUser[];
     }>(res);
     return result.data;
   }

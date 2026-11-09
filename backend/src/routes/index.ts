@@ -11,6 +11,7 @@ import {
   requireRole,
   requireDepartmentScope,
   requireDepartmentListAccess,
+  requireDepartmentTargetScope,
 } from '../middleware/auth.middleware.ts';
 import { validateBody } from '../middleware/validation.middleware.ts';
 import { runAllTests } from '../tests/runner.ts';
@@ -283,6 +284,14 @@ apiRouter.get(
   DepartmentController.getLines
 );
 
+// Scoped Assignable Users for Department Roster (Global manager or authorized Department Manager)
+apiRouter.get(
+  '/departments/:id/assignable-users',
+  authenticateJWT,
+  requireDepartmentScope('manage_employees'),
+  DepartmentController.getAssignableUsers
+);
+
 // Create Department (Admin only)
 apiRouter.post(
   '/departments',
@@ -325,12 +334,13 @@ apiRouter.post(
   DepartmentController.assignEmployee
 );
 
-// Transfer Employee to Another Department (Global manager or authorized Department Manager)
+// Transfer Employee to Another Department (Global manager or authorized Department Manager managing BOTH source and target)
 apiRouter.put(
   '/departments/:id/employees/transfer',
   authenticateJWT,
   requireDepartmentScope('manage_employees'),
   validateBody(['target_department_id', 'user_id']),
+  requireDepartmentTargetScope,
   DepartmentController.transferEmployee
 );
 
