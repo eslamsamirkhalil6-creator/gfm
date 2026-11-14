@@ -87,10 +87,34 @@ export const RETURN_CONDITIONS = [
   'WASTE_SCRAP',
 ] as const;
 
+export const MATERIAL_OPERATION_TYPES = [
+  'RETURN',
+  'TRANSFER',
+  'REQUISITION',
+  'INBOUND',
+] as const;
+
 export type StockStatus = (typeof STOCK_STATUSES)[number];
 export type MovementType = (typeof MOVEMENT_TYPES)[number];
 export type AdjustmentReasonCode = (typeof ADJUSTMENT_REASON_CODES)[number];
 export type ReturnCondition = (typeof RETURN_CONDITIONS)[number];
+export type MaterialOperationType = (typeof MATERIAL_OPERATION_TYPES)[number];
+
+const WAREHOUSE_COMPATIBLE_CATEGORY_MAP: Record<string, ReadonlySet<string>> = {
+  FABRIC: new Set(['FABRIC', 'TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE']),
+  RAW_MATERIAL: new Set(['FABRIC', 'TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE']),
+  TRIMS_ACCESSORIES: new Set(['TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE']),
+  FINISHED_GOODS: new Set(['FINISHED_GOOD', 'PACKAGING']),
+  WIP: new Set(['FABRIC', 'TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE']),
+  QUARANTINE: new Set(['FABRIC', 'TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE']),
+  GENERAL: new Set(['FABRIC', 'TRIM_ACCESSORY', 'PACKAGING', 'CONSUMABLE', 'FINISHED_GOOD']),
+};
+
+export function isCategoryCompatibleWithWarehouse(warehouseType: string, categoryType: string): boolean {
+  const allowed = WAREHOUSE_COMPATIBLE_CATEGORY_MAP[warehouseType];
+  if (!allowed) return true;
+  return allowed.has(categoryType);
+}
 
 export interface WarehouseActor {
   id: number;

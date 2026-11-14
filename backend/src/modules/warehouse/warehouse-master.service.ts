@@ -1,10 +1,11 @@
-import { query, withTransaction } from '../../config/database.ts';
+import { isPgMemEngine, query, sqlEqInt, sqlEqText, sqlInInt, withTransaction } from '../../config/database.ts';
 import { hasGlobalWarehouseAccess } from '../../middleware/auth.middleware.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import { InventoryEngineService } from './inventory-engine.service.ts';
 import {
   badRequest,
   conflict,
+  forbidden,
   notFound,
   parseEnumValue,
   parseNonNegativeNumber,
@@ -17,8 +18,10 @@ import {
   CreateLocationDTO,
   CreateMaterialDTO,
   CreateWarehouseDTO,
+  isCategoryCompatibleWithWarehouse,
   LOCATION_TYPES,
   MATERIAL_CATEGORY_TYPES,
+  MATERIAL_OPERATION_TYPES,
   MATERIAL_UOMS,
   STOCK_STATUSES,
   UpdateMaterialDTO,
@@ -49,11 +52,11 @@ export class WarehouseMasterService {
 
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND w.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('w.status', `$${params.length}`)}`;
     }
     if (filter?.warehouse_type) {
       params.push(filter.warehouse_type);
-      sql += ` AND w.warehouse_type = $${params.length}`;
+      sql += ` AND ${sqlEqText('w.warehouse_type', `$${params.length}`)}`;
     }
     if (filter?.search) {
       params.push(`%${filter.search}%`);
@@ -110,7 +113,7 @@ export class WarehouseMasterService {
         `SELECT ws.*, u.username, u.full_name, u.is_active as user_active
          FROM warehouse_staff ws
          JOIN users u ON ws.user_id = u.id
-         WHERE ws.warehouse_id + 0 = $1
+         WHERE ${sqlEqInt('ws.warehouse_id', '$1')}
          ORDER BY ws.is_primary DESC, ws.id ASC`,
         [warehouseId]
       ),
@@ -413,7 +416,7 @@ export class WarehouseMasterService {
       `SELECT ws.*, u.username, u.full_name, u.is_active as user_active
        FROM warehouse_staff ws
        JOIN users u ON ws.user_id = u.id
-       WHERE ws.warehouse_id + 0 = $1
+       WHERE ${sqlEqInt('ws.warehouse_id', '$1')}
        ORDER BY ws.is_primary DESC, ws.id ASC`,
       [warehouseId]
     );
@@ -671,7 +674,26 @@ export class WarehouseMasterService {
     return '{}';
   }
 
-  static async listMaterials(filter?: { category_id?: number; status?: string; search?: string }): Promise<any[]> {
+  static async listMaterials(
+    filter?: { category_id?: number; status?: string; search?: string; warehouse_id?: number; operation?: string },
+    actor?: WarehouseActor
+  ): Promise<any[]> {
+    let warehouseRow: any = null;
+    if (filter?.warehouse_id) {
+      if (actor && !hasGlobalWarehouseAccess(actor as any) && !actor.managed_warehouse_ids.includes(filter.warehouse_id)) {
+        throw forbidden(`Warehouse #${filter.warehouse_id} is outside your assigned warehouse scope`);
+      }
+      const whRes = await query<any>(`SELECT * FROM warehouses WHERE id = $1`, [filter.warehouse_id]);
+      if (whRes.rowCount === 0) {
+        throw notFound(`Warehouse #${filter.warehouse_id} not found`);
+      }
+      warehouseRow = whRes.rows[0];
+    }
+
+    const operation = filter?.operation
+      ? parseEnumValue(filter.operation.toUpperCase(), MATERIAL_OPERATION_TYPES, 'operation')
+      : undefined;
+
     const params: any[] = [];
     let sql = `
       SELECT m.*, mc.category_code, mc.name as category_name, mc.category_type
@@ -681,19 +703,46 @@ export class WarehouseMasterService {
     `;
     if (filter?.category_id) {
       params.push(filter.category_id);
-      sql += ` AND m.category_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('m.category_id', `$${params.length}`)}`;
     }
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND m.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('m.status', `$${params.length}`)}`;
     }
     if (filter?.search) {
       params.push(`%${filter.search}%`);
       sql += ` AND (m.sku ILIKE $${params.length} OR m.name ILIKE $${params.length} OR COALESCE(m.color, '') ILIKE $${params.length})`;
     }
     sql += ` ORDER BY m.id ASC`;
-    const res = await query(sql, params);
-    return res.rows;
+    const res = await query<any>(sql, params);
+    let rows = res.rows;
+
+    if (warehouseRow) {
+      if (warehouseRow.status !== 'active') {
+        return [];
+      }
+      rows = rows.filter((m) => isCategoryCompatibleWithWarehouse(warehouseRow.warehouse_type, m.category_type));
+
+      if (operation === 'TRANSFER') {
+        const availRes = await query<{ material_id: number; qty_available: string }>(
+          `SELECT material_id, qty_available
+           FROM inventory_balances
+           WHERE ${sqlEqInt('warehouse_id', '$1')}
+             AND ${sqlEqText('stock_status', "'AVAILABLE'")}
+             AND qty_on_hand > qty_reserved`,
+          [warehouseRow.id]
+        );
+        const availMap = new Map<number, number>();
+        for (const b of availRes.rows) {
+          availMap.set(b.material_id, roundQty((availMap.get(b.material_id) || 0) + Number(b.qty_available || 0)));
+        }
+        rows = rows
+          .filter((m) => (availMap.get(m.id) || 0) > 0)
+          .map((m) => ({ ...m, available_qty: availMap.get(m.id) || 0 }));
+      }
+    }
+
+    return rows;
   }
 
   static async getMaterialById(id: number): Promise<any> {
@@ -849,50 +898,58 @@ export class WarehouseMasterService {
     }
   ): Promise<any[]> {
     const isGlobal = hasGlobalWarehouseAccess(actor as any);
+    const pgMem = isPgMemEngine();
+    const aliasPrefix = pgMem ? '' : 'b.';
     const params: any[] = [];
-    let sql = `
+    const conditions: string[] = [];
+
+    if (filter.warehouse_id) {
+      params.push(filter.warehouse_id);
+      conditions.push(sqlEqInt(`${aliasPrefix}warehouse_id`, `$${params.length}`));
+    }
+    if (filter.location_id) {
+      params.push(filter.location_id);
+      conditions.push(sqlEqInt(`${aliasPrefix}location_id`, `$${params.length}`));
+    }
+    if (filter.material_id) {
+      params.push(filter.material_id);
+      conditions.push(sqlEqInt(`${aliasPrefix}material_id`, `$${params.length}`));
+    }
+    if (filter.lot_id) {
+      params.push(filter.lot_id);
+      conditions.push(sqlEqInt(`${aliasPrefix}lot_id`, `$${params.length}`));
+    }
+    if (filter.stock_status) {
+      const status = parseEnumValue(filter.stock_status, STOCK_STATUSES, 'stock_status');
+      params.push(status);
+      conditions.push(sqlEqText(`${aliasPrefix}stock_status`, `$${params.length}`));
+    }
+    if (filter.only_available) {
+      conditions.push(`${sqlEqText(`${aliasPrefix}stock_status`, "'AVAILABLE'")} AND ${aliasPrefix}qty_on_hand > ${aliasPrefix}qty_reserved`);
+    }
+    if (filter.only_reserved) {
+      conditions.push(`${aliasPrefix}qty_reserved > 0`);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const baseFrom = pgMem
+      ? `(SELECT * FROM inventory_balances ${whereClause}) b`
+      : `inventory_balances b`;
+
+    const sql = `
       SELECT b.*,
              w.warehouse_code, w.name as warehouse_name,
              l.location_code, l.name as location_name, l.location_type,
              m.sku, m.name as material_name, m.base_uom, m.weighted_avg_cost, m.reorder_level,
              lot.lot_number, lot.roll_number, lot.shade_code, lot.qc_status, lot.received_at
-      FROM inventory_balances b
+      FROM ${baseFrom}
       JOIN warehouses w ON b.warehouse_id = w.id
       JOIN warehouse_locations l ON b.location_id = l.id
       JOIN materials m ON b.material_id = m.id
       LEFT JOIN inventory_lots lot ON b.lot_id = lot.id
-      WHERE 1=1
+      ${pgMem ? '' : whereClause}
+      ORDER BY b.warehouse_id ASC, m.sku ASC, lot.received_at ASC NULLS LAST, b.id ASC
     `;
-
-    if (filter.warehouse_id) {
-      params.push(filter.warehouse_id);
-      sql += ` AND b.warehouse_id + 0 = $${params.length}`;
-    }
-    if (filter.location_id) {
-      params.push(filter.location_id);
-      sql += ` AND b.location_id + 0 = $${params.length}`;
-    }
-    if (filter.material_id) {
-      params.push(filter.material_id);
-      sql += ` AND b.material_id + 0 = $${params.length}`;
-    }
-    if (filter.lot_id) {
-      params.push(filter.lot_id);
-      sql += ` AND b.lot_id + 0 = $${params.length}`;
-    }
-    if (filter.stock_status) {
-      const status = parseEnumValue(filter.stock_status, STOCK_STATUSES, 'stock_status');
-      params.push(status);
-      sql += ` AND b.stock_status = $${params.length}`;
-    }
-    if (filter.only_available) {
-      sql += ` AND b.stock_status = 'AVAILABLE' AND b.qty_on_hand > b.qty_reserved`;
-    }
-    if (filter.only_reserved) {
-      sql += ` AND b.qty_reserved > 0`;
-    }
-
-    sql += ` ORDER BY b.warehouse_id ASC, m.sku ASC, lot.received_at ASC NULLS LAST, b.id ASC`;
 
     const res = await query<any>(sql, params);
     const allowedSet = new Set(actor.managed_warehouse_ids);
@@ -916,11 +973,11 @@ export class WarehouseMasterService {
     `;
     if (filter.material_id) {
       params.push(filter.material_id);
-      sql += ` AND l.material_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('l.material_id', `$${params.length}`)}`;
     }
     if (filter.qc_status) {
       params.push(filter.qc_status);
-      sql += ` AND l.qc_status = $${params.length}`;
+      sql += ` AND ${sqlEqText('l.qc_status', `$${params.length}`)}`;
     }
     if (filter.lot_number) {
       params.push(`%${filter.lot_number}%`);
@@ -985,27 +1042,27 @@ export class WarehouseMasterService {
     `;
     if (filter.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND sm.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sm.warehouse_id', `$${params.length}`)}`;
     }
     if (filter.material_id) {
       params.push(filter.material_id);
-      sql += ` AND sm.material_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sm.material_id', `$${params.length}`)}`;
     }
     if (filter.lot_id) {
       params.push(filter.lot_id);
-      sql += ` AND sm.lot_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sm.lot_id', `$${params.length}`)}`;
     }
     if (filter.movement_type) {
       params.push(filter.movement_type);
-      sql += ` AND sm.movement_type = $${params.length}`;
+      sql += ` AND ${sqlEqText('sm.movement_type', `$${params.length}`)}`;
     }
     if (filter.source_document_type) {
       params.push(filter.source_document_type);
-      sql += ` AND sm.source_document_type = $${params.length}`;
+      sql += ` AND ${sqlEqText('sm.source_document_type', `$${params.length}`)}`;
     }
     if (filter.source_document_id) {
       params.push(filter.source_document_id);
-      sql += ` AND sm.source_document_id = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sm.source_document_id', `$${params.length}`)}`;
     }
 
     const limit = Math.min(Math.max(filter.limit || 100, 1), 500);
@@ -1088,7 +1145,7 @@ export class WarehouseMasterService {
               m.weighted_avg_cost, m.total_valued_qty, m.total_inventory_value, m.last_cost_updated_at
        FROM materials m
        JOIN material_categories mc ON m.category_id = mc.id
-       WHERE m.status = 'active'
+       WHERE ${sqlEqText('m.status', "'active'")}
        ORDER BY m.sku ASC`
     );
     const totalValuation = roundQty(
@@ -1105,14 +1162,81 @@ export class WarehouseMasterService {
     return InventoryEngineService.reconcileBalancesVsMovements({ warehouseId, materialId });
   }
 
+  /**
+   * Minimal operational active department lookup scoped to WMS & Requisition/Return workflows.
+   * Exposes strictly { id, dept_code, name, status } with fail-closed actor scope enforcement.
+   */
+  static async listAuthorizedDepartments(
+    actor: WarehouseActor
+  ): Promise<Array<{ id: number; dept_code: string; name: string; status: string }>> {
+    const hasGlobalDeptAccess =
+      hasGlobalWarehouseAccess(actor as any) || actor.permissions.includes('departments:view');
+
+    if (hasGlobalDeptAccess || actor.managed_warehouse_ids.length > 0) {
+      const res = await query<{ id: number; dept_code: string; name: string; status: string }>(
+        `SELECT id, dept_code, name, status
+         FROM departments
+         WHERE ${sqlEqText('status', "'active'")}
+         ORDER BY dept_code ASC, id ASC`
+      );
+      return res.rows;
+    }
+
+    const scopedDeptIds = new Set<number>(actor.managed_department_ids);
+    if (actor.supervised_line_ids.length > 0) {
+      const linePlaceholders = actor.supervised_line_ids.map((_, idx) => `$${idx + 1}`).join(', ');
+      const lineRes = await query<{ department_id: number | null }>(
+        `SELECT DISTINCT department_id FROM production_lines WHERE ${sqlInInt('id', linePlaceholders)} AND department_id IS NOT NULL`,
+        actor.supervised_line_ids
+      );
+      for (const row of lineRes.rows) {
+        if (row.department_id) scopedDeptIds.add(row.department_id);
+      }
+    }
+
+    const deptIds = Array.from(scopedDeptIds);
+    if (deptIds.length === 0) {
+      return [];
+    }
+
+    const placeholders = deptIds.map((_, idx) => `$${idx + 1}`).join(', ');
+    const res = await query<{ id: number; dept_code: string; name: string; status: string }>(
+      `SELECT id, dept_code, name, status
+       FROM departments
+       WHERE ${sqlEqText('status', "'active'")}
+         AND ${sqlInInt('id', placeholders)}
+       ORDER BY dept_code ASC, id ASC`,
+      deptIds
+    );
+    return res.rows;
+  }
+
   // ============================================================================
   // 5.14 In-App Notifications
   // ============================================================================
+  static canActorAccessNotification(actor: WarehouseActor, n: any): boolean {
+    if (n.recipient_user_id !== null && n.recipient_user_id !== undefined) {
+      return n.recipient_user_id === actor.id;
+    }
+    const isGlobal = hasGlobalWarehouseAccess(actor as any);
+    const roleSet = new Set(actor.roles);
+    const whSet = new Set(actor.managed_warehouse_ids);
+    const roleMatch =
+      !n.target_role_name ||
+      roleSet.has(n.target_role_name) ||
+      actor.roles.includes('Factory Manager') ||
+      actor.roles.includes('System Administrator');
+    if (!roleMatch) return false;
+    if (n.warehouse_id !== null && n.warehouse_id !== undefined && !isGlobal && !whSet.has(n.warehouse_id)) {
+      return false;
+    }
+    return true;
+  }
+
   static async listNotifications(
     actor: WarehouseActor,
     filter?: { unread_only?: boolean; warehouse_id?: number; limit?: number }
   ): Promise<any[]> {
-    const isGlobal = hasGlobalWarehouseAccess(actor as any);
     const params: any[] = [];
     let sql = `SELECT * FROM warehouse_notifications WHERE 1=1`;
 
@@ -1129,33 +1253,43 @@ export class WarehouseMasterService {
     sql += ` ORDER BY is_read ASC, created_at DESC, id DESC LIMIT $${params.length}`;
 
     const res = await query<any>(sql, params);
-    const roleSet = new Set(actor.roles);
-    const whSet = new Set(actor.managed_warehouse_ids);
-
-    return res.rows.filter((n) => {
-      if (n.recipient_user_id !== null && n.recipient_user_id === actor.id) return true;
-      const roleMatch = !n.target_role_name || roleSet.has(n.target_role_name) || actor.roles.includes('Factory Manager') || actor.roles.includes('System Administrator');
-      if (!roleMatch) return false;
-      if (n.warehouse_id !== null && !isGlobal && !whSet.has(n.warehouse_id)) return false;
-      return true;
-    });
+    return res.rows.filter((n) => this.canActorAccessNotification(actor, n));
   }
 
   static async markNotificationRead(notificationId: number, actor: WarehouseActor): Promise<any> {
-    const res = await query<any>(
-      `UPDATE warehouse_notifications SET is_read = TRUE, read_at = NOW() WHERE id = $1 RETURNING *`,
-      [notificationId]
-    );
-    if (res.rowCount === 0) throw notFound(`Notification #${notificationId} not found`);
+    return withTransaction(async (txQuery) => {
+      const existingRes = await txQuery<any>(
+        `SELECT * FROM warehouse_notifications WHERE id = $1 FOR UPDATE`,
+        [notificationId]
+      );
+      if (existingRes.rowCount === 0) {
+        throw notFound(`Notification #${notificationId} not found`);
+      }
 
-    await AuditService.log({
-      userId: actor.id,
-      action: 'WMS_NOTIFICATION_READ',
-      entityType: 'WAREHOUSE_NOTIFICATION',
-      entityId: notificationId,
-      ipAddress: actor.ipAddress,
+      const notification = existingRes.rows[0];
+      if (!this.canActorAccessNotification(actor, notification)) {
+        throw forbidden('Access denied. This notification belongs to another user, role, or warehouse scope.');
+      }
+
+      const updRes = await txQuery<any>(
+        `UPDATE warehouse_notifications SET is_read = TRUE, read_at = NOW() WHERE id = $1 RETURNING *`,
+        [notificationId]
+      );
+
+      await AuditService.log(
+        {
+          userId: actor.id,
+          action: 'WMS_NOTIFICATION_READ',
+          entityType: 'WAREHOUSE_NOTIFICATION',
+          entityId: notificationId,
+          details: { notification_type: notification.notification_type, warehouse_id: notification.warehouse_id },
+          ipAddress: actor.ipAddress,
+        },
+        txQuery
+      );
+
+      return updRes.rows[0];
     });
-    return res.rows[0];
   }
 
   static async generateDelayedTransferAlerts(maxHoursInTransit: number, actor: WarehouseActor): Promise<any[]> {

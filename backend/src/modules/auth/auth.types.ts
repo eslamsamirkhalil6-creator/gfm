@@ -12,6 +12,7 @@ export interface LoginResponse {
     primary_department_id: number | null;
     managed_warehouse_ids: number[];
     supervised_line_ids: number[];
+    planning_department_ids: number[];
   };
 }
 
@@ -26,6 +27,7 @@ export interface UserProfile {
   primary_department_id: number | null;
   managed_warehouse_ids: number[];
   supervised_line_ids: number[];
+  planning_department_ids: number[];
   created_at: string;
 }
 

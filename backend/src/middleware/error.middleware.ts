@@ -15,7 +15,9 @@ export function errorHandler(
   const statusCode = err.statusCode || 500;
   const errorCode = err.code || (statusCode >= 500 ? 'INTERNAL_SERVER_ERROR' : 'BAD_REQUEST');
 
-  console.error(`[API Error] [${req.method} ${req.originalUrl}] [${statusCode}] ${err.message}`, err.stack);
+  if (statusCode >= 500) {
+    console.error(`[API Error] [${req.method} ${req.originalUrl}] [${statusCode}] ${err.message}`, err.stack);
+  }
 
   res.status(statusCode).json({
     success: false,

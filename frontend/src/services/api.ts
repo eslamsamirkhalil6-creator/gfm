@@ -17,6 +17,37 @@ import {
   DepartmentEmployee,
   DepartmentManagerHistoryItem,
   DepartmentProductionLine,
+  PlanningDashboardData,
+  PlanningSchedule,
+  PaginatedResult,
+  Warehouse,
+  WarehouseLocation,
+  WarehouseStaffAssignment,
+  WarehouseSetting,
+  MaterialCategory,
+  MaterialItem,
+  InventoryBalance,
+  InventoryLot,
+  StockMovement,
+  InventorySummary,
+  InventoryValuationReport,
+  LedgerReconciliationReport,
+  GoodsReceipt,
+  GoodsReceiptItem,
+  PendingQcItem,
+  QcInspection,
+  MaterialRequisition,
+  MaterialRequisitionItem,
+  StockIssue,
+  MaterialReturn,
+  WarehouseTransfer,
+  WarehouseTransferItem,
+  StockCount,
+  StockCountItem,
+  StockAdjustment,
+  ReorderRequest,
+  WarehouseNotification,
+  WarehouseDepartmentOption,
 } from '../types/index.ts';
 
 const TOKEN_KEY = 'gfms_auth_token';
@@ -572,5 +603,1036 @@ export class ApiService {
       headers: this.getHeaders(),
     });
     await this.handleResponse(res);
+  }
+
+  // ==========================================
+  // Scoped Department Planning APIs
+  // ==========================================
+
+  static async getPlanningDashboard(): Promise<PlanningDashboardData> {
+    const res = await fetch('/api/planning/dashboard', { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: PlanningDashboardData }>(res);
+    return result.data;
+  }
+
+  static async createPlanningSchedule(payload: {
+    department_id: number;
+    production_line_id?: number | null;
+    plan_code: string;
+    title: string;
+    target_daily_output?: number;
+    planned_start_date: string;
+    planned_end_date: string;
+    status?: 'draft' | 'active' | 'completed' | 'cancelled';
+    notes?: string;
+  }): Promise<PlanningSchedule> {
+    const res = await fetch('/api/planning/schedules', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: PlanningSchedule }>(res);
+    return result.data;
+  }
+
+  static async updatePlanningScheduleStatus(
+    scheduleId: number,
+    status: 'draft' | 'active' | 'completed' | 'cancelled'
+  ): Promise<PlanningSchedule> {
+    const res = await fetch(`/api/planning/schedules/${scheduleId}/status`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ status }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: PlanningSchedule }>(res);
+    return result.data;
+  }
+
+  // ==========================================
+  // Warehouse & Inventory Management (Phase 07)
+  // ==========================================
+
+  private static buildQuery(params?: Record<string, string | number | boolean | undefined | null>): string {
+    const q = new URLSearchParams();
+    if (!params) return '';
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') {
+        q.set(k, String(v));
+      }
+    }
+    const qs = q.toString();
+    return qs ? `?${qs}` : '';
+  }
+
+  // 5.1 Warehouses, Bins, Staff & Settings
+  static async getWarehouses(params?: {
+    status?: string;
+    warehouse_type?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<Warehouse>> {
+    const res = await fetch(`/api/warehouses${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: Warehouse[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getWarehouseById(id: number): Promise<{
+    warehouse: Warehouse;
+    locations: WarehouseLocation[];
+    staff: WarehouseStaffAssignment[];
+  }> {
+    const res = await fetch(`/api/warehouses/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { warehouse: Warehouse; locations: WarehouseLocation[]; staff: WarehouseStaffAssignment[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async createWarehouse(payload: {
+    warehouse_code: string;
+    name: string;
+    warehouse_type: string;
+    department_id?: number | null;
+    manager_id?: number | null;
+    require_bin_tracking?: boolean;
+    description?: string;
+  }): Promise<{ warehouse: Warehouse; default_location: WarehouseLocation }> {
+    const res = await fetch('/api/warehouses', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { warehouse: Warehouse; default_location: WarehouseLocation };
+    }>(res);
+    return result.data;
+  }
+
+  static async updateWarehouse(
+    id: number,
+    payload: {
+      name?: string;
+      warehouse_type?: string;
+      department_id?: number | null;
+      manager_id?: number | null;
+      require_bin_tracking?: boolean;
+      description?: string;
+    }
+  ): Promise<Warehouse> {
+    const res = await fetch(`/api/warehouses/${id}`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: Warehouse }>(res);
+    return result.data;
+  }
+
+  static async toggleWarehouseStatus(id: number, status: 'active' | 'inactive'): Promise<Warehouse> {
+    const res = await fetch(`/api/warehouses/${id}/status`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ status }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: Warehouse }>(res);
+    return result.data;
+  }
+
+  static async getWarehouseLocations(warehouseId: number): Promise<WarehouseLocation[]> {
+    const res = await fetch(`/api/warehouses/${warehouseId}/locations`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseLocation[] }>(res);
+    return result.data;
+  }
+
+  static async createWarehouseLocation(
+    warehouseId: number,
+    payload: {
+      location_code: string;
+      name: string;
+      location_type: string;
+      zone?: string;
+      aisle?: string;
+      rack?: string;
+      bin?: string;
+    }
+  ): Promise<WarehouseLocation> {
+    const res = await fetch(`/api/warehouses/${warehouseId}/locations`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseLocation }>(res);
+    return result.data;
+  }
+
+  static async toggleLocationStatus(
+    warehouseId: number,
+    locationId: number,
+    status: 'active' | 'inactive'
+  ): Promise<WarehouseLocation> {
+    const res = await fetch(`/api/warehouses/${warehouseId}/locations/${locationId}/status`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ status }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseLocation }>(res);
+    return result.data;
+  }
+
+  static async assignWarehouseStaff(
+    warehouseId: number,
+    payload: {
+      user_id: number;
+      staff_role: string;
+      is_primary?: boolean;
+      effective_from?: string;
+      effective_to?: string | null;
+      notes?: string;
+    }
+  ): Promise<WarehouseStaffAssignment> {
+    const res = await fetch(`/api/warehouses/${warehouseId}/staff`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseStaffAssignment }>(res);
+    return result.data;
+  }
+
+  static async removeWarehouseStaff(warehouseId: number, userId: number): Promise<void> {
+    const res = await fetch(`/api/warehouses/${warehouseId}/staff/${userId}`, {
+      method: 'DELETE',
+      headers: this.getHeaders(),
+    });
+    await this.handleResponse(res);
+  }
+
+  static async getWarehouseSettings(): Promise<WarehouseSetting[]> {
+    const res = await fetch('/api/warehouse/settings', { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseSetting[] }>(res);
+    return result.data;
+  }
+
+  static async getWarehouseDepartments(): Promise<WarehouseDepartmentOption[]> {
+    const res = await fetch('/api/warehouse/departments', { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseDepartmentOption[] }>(res);
+    return result.data;
+  }
+
+  static async updateWarehouseSetting(key: string, settingValue: string): Promise<WarehouseSetting> {
+    const res = await fetch(`/api/warehouse/settings/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ setting_value: settingValue }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseSetting }>(res);
+    return result.data;
+  }
+
+  // 5.2 Categories & Materials
+  static async getMaterialCategories(status?: string): Promise<MaterialCategory[]> {
+    const res = await fetch(`/api/warehouse/categories${this.buildQuery({ status })}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialCategory[] }>(res);
+    return result.data;
+  }
+
+  static async createMaterialCategory(payload: {
+    category_code: string;
+    name: string;
+    category_type: string;
+    description?: string;
+  }): Promise<MaterialCategory> {
+    const res = await fetch('/api/warehouse/categories', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialCategory }>(res);
+    return result.data;
+  }
+
+  static async getMaterials(params?: {
+    category_id?: number;
+    status?: string;
+    search?: string;
+    warehouse_id?: number;
+    operation?: 'RETURN' | 'TRANSFER' | 'REQUISITION' | 'INBOUND';
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<MaterialItem>> {
+    const res = await fetch(`/api/warehouse/materials${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialItem[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async createMaterial(payload: {
+    sku: string;
+    name: string;
+    category_id: number;
+    base_uom: string;
+    color?: string;
+    size?: string;
+    attributes?: Record<string, any>;
+    is_lot_tracked?: boolean;
+    is_roll_tracked?: boolean;
+    requires_qc_on_receipt?: boolean;
+    min_stock_level?: number;
+    reorder_level?: number;
+  }): Promise<MaterialItem> {
+    const res = await fetch('/api/warehouse/materials', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialItem }>(res);
+    return result.data;
+  }
+
+  static async updateMaterial(
+    id: number,
+    payload: {
+      name?: string;
+      category_id?: number;
+      base_uom?: string;
+      color?: string | null;
+      size?: string | null;
+      attributes?: Record<string, any>;
+      is_lot_tracked?: boolean;
+      is_roll_tracked?: boolean;
+      requires_qc_on_receipt?: boolean;
+      min_stock_level?: number;
+      reorder_level?: number;
+      status?: 'active' | 'inactive';
+    }
+  ): Promise<MaterialItem> {
+    const res = await fetch(`/api/warehouse/materials/${id}`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialItem }>(res);
+    return result.data;
+  }
+
+  // 5.3 Inventory Inquiry, Valuation & Reconciliation
+  static async getInventoryBalances(params?: {
+    warehouse_id?: number;
+    location_id?: number;
+    material_id?: number;
+    lot_id?: number;
+    stock_status?: string;
+    only_available?: boolean;
+    only_reserved?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<InventoryBalance>> {
+    const res = await fetch(`/api/inventory/balances${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: InventoryBalance[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getAvailableBalances(warehouseId?: number, materialId?: number): Promise<InventoryBalance[]> {
+    const res = await fetch(
+      `/api/inventory/available${this.buildQuery({ warehouse_id: warehouseId, material_id: materialId })}`,
+      { headers: this.getHeaders() }
+    );
+    const result = await this.handleResponse<{ success: boolean; data: InventoryBalance[] }>(res);
+    return result.data;
+  }
+
+  static async getInventoryLots(params?: {
+    warehouse_id?: number;
+    material_id?: number;
+    qc_status?: string;
+    lot_number?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<InventoryLot>> {
+    const res = await fetch(`/api/inventory/lots${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: InventoryLot[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getStockMovements(params?: {
+    warehouse_id?: number;
+    material_id?: number;
+    lot_id?: number;
+    movement_type?: string;
+    source_document_type?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<StockMovement>> {
+    const res = await fetch(`/api/inventory/movements${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: StockMovement[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getInventorySummary(warehouseId?: number): Promise<InventorySummary> {
+    const res = await fetch(`/api/inventory/summary${this.buildQuery({ warehouse_id: warehouseId })}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: InventorySummary }>(res);
+    return result.data;
+  }
+
+  static async getInventoryValuation(): Promise<InventoryValuationReport> {
+    const res = await fetch('/api/inventory/valuation', { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: InventoryValuationReport }>(res);
+    return result.data;
+  }
+
+  static async reconcileInventoryLedger(warehouseId?: number, materialId?: number): Promise<LedgerReconciliationReport> {
+    const res = await fetch(
+      `/api/inventory/reconcile${this.buildQuery({ warehouse_id: warehouseId, material_id: materialId })}`,
+      { headers: this.getHeaders() }
+    );
+    const result = await this.handleResponse<{ success: boolean; data: LedgerReconciliationReport }>(res);
+    return result.data;
+  }
+
+  // 5.4 Goods Receiving (GRN)
+  static async getGrns(params?: {
+    warehouse_id?: number;
+    status?: string;
+    po_reference?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<GoodsReceipt>> {
+    const res = await fetch(`/api/warehouse/grns${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: GoodsReceipt[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getGrnById(id: number): Promise<{ grn: GoodsReceipt; items: GoodsReceiptItem[] }> {
+    const res = await fetch(`/api/warehouse/grns/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: { grn: GoodsReceipt; items: GoodsReceiptItem[] } }>(res);
+    return result.data;
+  }
+
+  static async createGrn(payload: {
+    warehouse_id: number;
+    supplier_name: string;
+    delivery_note_no?: string;
+    po_reference?: string;
+    notes?: string;
+  }): Promise<{ grn: GoodsReceipt; items: GoodsReceiptItem[] }> {
+    const res = await fetch('/api/warehouse/grns', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { grn: GoodsReceipt; items: GoodsReceiptItem[] } }>(res);
+    return result.data;
+  }
+
+  static async addGrnItem(
+    grnId: number,
+    payload: {
+      material_id: number;
+      target_location_id?: number;
+      ordered_qty?: number;
+      received_qty: number;
+      accepted_qty?: number;
+      rejected_qty?: number;
+      damaged_qty?: number;
+      pending_inspection_qty?: number;
+      unit_cost?: number;
+      lot_number?: string;
+      roll_number?: string;
+      shade_code?: string;
+      supplier_batch?: string;
+      notes?: string;
+    }
+  ): Promise<GoodsReceiptItem> {
+    const res = await fetch(`/api/warehouse/grns/${grnId}/items`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: GoodsReceiptItem }>(res);
+    return result.data;
+  }
+
+  static async postGrn(grnId: number): Promise<{ grn: GoodsReceipt }> {
+    const res = await fetch(`/api/warehouse/grns/${grnId}/post`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { grn: GoodsReceipt } }>(res);
+    return result.data;
+  }
+
+  // 5.5 QC Inspection & Override
+  static async getPendingQc(params?: { warehouse_id?: number; limit?: number; offset?: number }): Promise<PaginatedResult<PendingQcItem>> {
+    const res = await fetch(`/api/warehouse/qc/pending${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: PendingQcItem[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getQcHistory(params?: {
+    warehouse_id?: number;
+    material_id?: number;
+    lot_id?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<QcInspection>> {
+    const res = await fetch(`/api/warehouse/qc/history${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: QcInspection[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async performQcInspection(payload: {
+    grn_item_id: number;
+    passed_qty: number;
+    rejected_qty?: number;
+    damaged_qty?: number;
+    target_location_id?: number;
+    reject_stock_status?: 'DAMAGED' | 'SCRAP';
+    notes?: string;
+  }): Promise<{ inspection: QcInspection }> {
+    const res = await fetch('/api/warehouse/qc/inspect', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { inspection: QcInspection } }>(res);
+    return result.data;
+  }
+
+  static async overrideQcStatus(payload: {
+    warehouse_id: number;
+    location_id?: number;
+    target_location_id?: number;
+    material_id: number;
+    lot_id?: number;
+    from_stock_status: 'QUARANTINE' | 'HOLD' | 'DAMAGED';
+    to_stock_status?: 'AVAILABLE' | 'HOLD' | 'DAMAGED' | 'SCRAP';
+    quantity: number;
+    reason: string;
+  }): Promise<{ inspection: QcInspection }> {
+    const res = await fetch('/api/warehouse/qc/override', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { inspection: QcInspection } }>(res);
+    return result.data;
+  }
+
+  // 5.6 Material Requisitions
+  static async getRequisitions(params?: {
+    status?: string;
+    warehouse_id?: number;
+    department_id?: number;
+    production_line_id?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<MaterialRequisition>> {
+    const res = await fetch(`/api/warehouse/requisitions${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisition[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getRequisitionById(id: number): Promise<{ requisition: MaterialRequisition; items: MaterialRequisitionItem[] }> {
+    const res = await fetch(`/api/warehouse/requisitions/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { requisition: MaterialRequisition; items: MaterialRequisitionItem[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async createRequisition(payload: {
+    department_id: number;
+    production_line_id?: number | null;
+    warehouse_id: number;
+    reference_type?: string;
+    reference_code?: string;
+    required_date?: string;
+    notes?: string;
+    items?: Array<{ material_id: number; preferred_lot_id?: number | null; requested_qty: number; notes?: string }>;
+  }): Promise<{ requisition: MaterialRequisition; items: MaterialRequisitionItem[] }> {
+    const res = await fetch('/api/warehouse/requisitions', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { requisition: MaterialRequisition; items: MaterialRequisitionItem[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async addRequisitionItem(
+    requisitionId: number,
+    payload: { material_id: number; preferred_lot_id?: number | null; requested_qty: number; notes?: string }
+  ): Promise<MaterialRequisitionItem> {
+    const res = await fetch(`/api/warehouse/requisitions/${requisitionId}/items`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisitionItem }>(res);
+    return result.data;
+  }
+
+  static async submitRequisition(id: number): Promise<MaterialRequisition> {
+    const res = await fetch(`/api/warehouse/requisitions/${id}/submit`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisition }>(res);
+    return result.data;
+  }
+
+  static async approveRequisition(id: number): Promise<MaterialRequisition> {
+    const res = await fetch(`/api/warehouse/requisitions/${id}/approve`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisition }>(res);
+    return result.data;
+  }
+
+  static async rejectRequisition(id: number, reason?: string): Promise<MaterialRequisition> {
+    const res = await fetch(`/api/warehouse/requisitions/${id}/reject`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ reason }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisition }>(res);
+    return result.data;
+  }
+
+  static async cancelRequisition(id: number): Promise<MaterialRequisition> {
+    const res = await fetch(`/api/warehouse/requisitions/${id}/cancel`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialRequisition }>(res);
+    return result.data;
+  }
+
+  // 5.7 Stock Issuing
+  static async getStockIssues(params?: {
+    warehouse_id?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<StockIssue>> {
+    const res = await fetch(`/api/warehouse/issues${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: StockIssue[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getStockIssueById(id: number): Promise<{ issue: StockIssue; items: any[] }> {
+    const res = await fetch(`/api/warehouse/issues/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: { issue: StockIssue; items: any[] } }>(res);
+    return result.data;
+  }
+
+  static async issueStock(payload: {
+    requisition_id: number;
+    received_by?: number;
+    notes?: string;
+    items: Array<{
+      requisition_item_id: number;
+      location_id?: number;
+      lot_id?: number | null;
+      issued_qty: number;
+      fifo_override_reason?: string;
+    }>;
+  }): Promise<{ issue: StockIssue }> {
+    const res = await fetch('/api/warehouse/issues', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { issue: StockIssue } }>(res);
+    return result.data;
+  }
+
+  // 5.8 Material Returns
+  static async getMaterialReturns(params?: {
+    warehouse_id?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<MaterialReturn>> {
+    const res = await fetch(`/api/warehouse/returns${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: MaterialReturn[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async createMaterialReturn(payload: {
+    department_id: number;
+    production_line_id?: number;
+    stock_issue_id?: number;
+    warehouse_id: number;
+    target_location_id?: number;
+    material_id: number;
+    lot_id?: number;
+    returned_qty: number;
+    return_condition: 'USABLE_SURPLUS' | 'DAMAGED' | 'WASTE_SCRAP';
+    notes?: string;
+  }): Promise<{ material_return: MaterialReturn }> {
+    const res = await fetch('/api/warehouse/returns', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { material_return: MaterialReturn } }>(res);
+    return result.data;
+  }
+
+  // 5.9 Transfers
+  static async getTransfers(params?: {
+    status?: string;
+    transfer_type?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<WarehouseTransfer>> {
+    const res = await fetch(`/api/warehouse/transfers${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseTransfer[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async getTransferById(id: number): Promise<{ transfer: WarehouseTransfer; items: WarehouseTransferItem[] }> {
+    const res = await fetch(`/api/warehouse/transfers/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { transfer: WarehouseTransfer; items: WarehouseTransferItem[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async executeInternalTransfer(payload: {
+    warehouse_id: number;
+    notes?: string;
+    items: Array<{
+      source_location_id: number;
+      target_location_id: number;
+      material_id: number;
+      lot_id?: number | null;
+      quantity: number;
+    }>;
+  }): Promise<{ transfer: WarehouseTransfer }> {
+    const res = await fetch('/api/warehouse/transfers/internal', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { transfer: WarehouseTransfer } }>(res);
+    return result.data;
+  }
+
+  static async dispatchInterWarehouseTransfer(payload: {
+    source_warehouse_id: number;
+    target_warehouse_id: number;
+    notes?: string;
+    items: Array<{
+      source_location_id?: number;
+      target_location_id?: number;
+      material_id: number;
+      lot_id?: number | null;
+      dispatched_qty: number;
+    }>;
+  }): Promise<{ transfer: WarehouseTransfer }> {
+    const res = await fetch('/api/warehouse/transfers/dispatch', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { transfer: WarehouseTransfer } }>(res);
+    return result.data;
+  }
+
+  static async receiveInterWarehouseTransfer(
+    transferId: number,
+    payload: {
+      notes?: string;
+      items: Array<{
+        transfer_item_id: number;
+        received_qty: number;
+        damaged_qty?: number;
+        discrepancy_qty?: number;
+        notes?: string;
+      }>;
+    }
+  ): Promise<{ transfer: WarehouseTransfer }> {
+    const res = await fetch(`/api/warehouse/transfers/${transferId}/receive`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { transfer: WarehouseTransfer } }>(res);
+    return result.data;
+  }
+
+  // 5.10 Stock Counts
+  static async getStockCounts(params?: {
+    warehouse_id?: number;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<StockCount>> {
+    const res = await fetch(`/api/warehouse/counts${this.buildQuery(params)}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{ success: boolean; data: StockCount[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async createStockCount(payload: {
+    warehouse_id: number;
+    count_type: 'CYCLE' | 'FULL';
+    material_id?: number;
+    location_id?: number;
+    notes?: string;
+  }): Promise<{ stock_count: StockCount; items: StockCountItem[] }> {
+    const res = await fetch('/api/warehouse/counts', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { stock_count: StockCount; items: StockCountItem[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async getStockCountById(id: number): Promise<{ stock_count: StockCount; items: StockCountItem[] }> {
+    const res = await fetch(`/api/warehouse/counts/${id}`, { headers: this.getHeaders() });
+    const result = await this.handleResponse<{
+      success: boolean;
+      data: { stock_count: StockCount; items: StockCountItem[] };
+    }>(res);
+    return result.data;
+  }
+
+  static async recordStockCountItems(
+    countId: number,
+    items: Array<{ stock_count_item_id: number; counted_qty: number; notes?: string }>
+  ): Promise<{ items: StockCountItem[] }> {
+    const res = await fetch(`/api/warehouse/counts/${countId}/items`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ items }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { items: StockCountItem[] } }>(res);
+    return result.data;
+  }
+
+  static async submitStockCount(countId: number): Promise<StockCount> {
+    const res = await fetch(`/api/warehouse/counts/${countId}/submit`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: StockCount }>(res);
+    return result.data;
+  }
+
+  static async approveStockCount(countId: number): Promise<{ stock_count: StockCount }> {
+    const res = await fetch(`/api/warehouse/counts/${countId}/approve`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { stock_count: StockCount } }>(res);
+    return result.data;
+  }
+
+  // 5.11 Stock Adjustments & Write-Offs
+  static async getAdjustments(params?: {
+    warehouse_id?: number;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<StockAdjustment>> {
+    const res = await fetch(`/api/warehouse/adjustments${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: StockAdjustment[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async createAdjustment(payload: {
+    warehouse_id: number;
+    location_id?: number;
+    material_id: number;
+    lot_id?: number | null;
+    stock_status?: string;
+    direction: 'IN' | 'OUT';
+    quantity: number;
+    unit_cost?: number;
+    reason_code: string;
+    notes?: string;
+  }): Promise<StockAdjustment> {
+    const res = await fetch('/api/warehouse/adjustments', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: StockAdjustment }>(res);
+    return result.data;
+  }
+
+  static async approveAdjustment(id: number): Promise<{ adjustment: StockAdjustment }> {
+    const res = await fetch(`/api/warehouse/adjustments/${id}/approve`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { adjustment: StockAdjustment } }>(res);
+    return result.data;
+  }
+
+  static async rejectAdjustment(id: number, reason?: string): Promise<StockAdjustment> {
+    const res = await fetch(`/api/warehouse/adjustments/${id}/reject`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ reason }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: StockAdjustment }>(res);
+    return result.data;
+  }
+
+  // 5.12 Reorder Requests
+  static async getReorders(params?: {
+    warehouse_id?: number;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<ReorderRequest>> {
+    const res = await fetch(`/api/warehouse/reorders${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async createReorder(payload: {
+    material_id: number;
+    warehouse_id: number;
+    requested_qty: number;
+    priority?: 'NORMAL' | 'URGENT';
+    required_date?: string;
+    justification?: string;
+  }): Promise<ReorderRequest> {
+    const res = await fetch('/api/warehouse/reorders', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest }>(res);
+    return result.data;
+  }
+
+  static async submitReorder(id: number): Promise<ReorderRequest> {
+    const res = await fetch(`/api/warehouse/reorders/${id}/submit`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest }>(res);
+    return result.data;
+  }
+
+  static async reviewReorder(id: number, payload: { supplier_note?: string; po_reference?: string }): Promise<ReorderRequest> {
+    const res = await fetch(`/api/warehouse/reorders/${id}/review`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest }>(res);
+    return result.data;
+  }
+
+  static async approveReorder(id: number): Promise<ReorderRequest> {
+    const res = await fetch(`/api/warehouse/reorders/${id}/approve`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest }>(res);
+    return result.data;
+  }
+
+  static async rejectReorder(id: number, reason?: string): Promise<ReorderRequest> {
+    const res = await fetch(`/api/warehouse/reorders/${id}/reject`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ reason }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: ReorderRequest }>(res);
+    return result.data;
+  }
+
+  // 5.13 Finished Goods Handover
+  static async receiveFinishedGoods(payload: {
+    department_id: number;
+    production_line_id?: number;
+    warehouse_id: number;
+    target_location_id?: number;
+    material_id: number;
+    quantity: number;
+    unit_cost?: number;
+    lot_number?: string;
+    handover_ref?: string;
+    notes?: string;
+  }): Promise<{ receipt: GoodsReceipt }> {
+    const res = await fetch('/api/warehouse/finished-goods/receive', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { receipt: GoodsReceipt } }>(res);
+    return result.data;
+  }
+
+  // 5.14 In-App Notifications
+  static async getWarehouseNotifications(params?: {
+    unread_only?: boolean;
+    warehouse_id?: number;
+    limit?: number;
+    offset?: number;
+  }): Promise<PaginatedResult<WarehouseNotification>> {
+    const res = await fetch(`/api/warehouse/notifications${this.buildQuery(params)}`, {
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseNotification[]; pagination: { total: number; limit: number; offset: number } }>(res);
+    return { data: result.data, pagination: result.pagination };
+  }
+
+  static async markNotificationRead(id: number): Promise<WarehouseNotification> {
+    const res = await fetch(`/api/warehouse/notifications/${id}/read`, {
+      method: 'PUT',
+      headers: this.getHeaders(),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: WarehouseNotification }>(res);
+    return result.data;
+  }
+
+  static async scanDelayedTransfers(maxHoursInTransit = 24): Promise<{ alerts_created: number; transfers: any[] }> {
+    const res = await fetch('/api/warehouse/notifications/scan-delayed-transfers', {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: JSON.stringify({ max_hours_in_transit: maxHoursInTransit }),
+    });
+    const result = await this.handleResponse<{ success: boolean; data: { alerts_created: number; transfers: any[] } }>(res);
+    return result.data;
   }
 }

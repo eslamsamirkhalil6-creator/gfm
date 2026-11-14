@@ -6,6 +6,7 @@ import { AuditController } from '../modules/audit/audit.controller.ts';
 import { ProductionController } from '../modules/production/production.controller.ts';
 import { DepartmentController } from '../modules/departments/department.controller.ts';
 import { wmsRouter } from '../modules/warehouse/warehouse.routes.ts';
+import { planningRouter } from '../modules/planning/planning.routes.ts';
 import {
   authenticateJWT,
   requirePermission,
@@ -15,15 +16,17 @@ import {
   requireDepartmentTargetScope,
 } from '../middleware/auth.middleware.ts';
 import { validateBody } from '../middleware/validation.middleware.ts';
+import { createLoginRateLimiter } from '../middleware/rate-limit.middleware.ts';
 import { runAllTests } from '../tests/runner.ts';
 
 export const apiRouter = Router();
+const loginRateLimiter = createLoginRateLimiter();
 
 // Health Check (Public)
 apiRouter.get('/health', HealthController.check);
 
-// Authentication (Public)
-apiRouter.post('/auth/login', validateBody(['username', 'password']), AuthController.login);
+// Authentication (Public, rate-limited against brute-force attempts)
+apiRouter.post('/auth/login', loginRateLimiter, validateBody(['username', 'password']), AuthController.login);
 apiRouter.post('/auth/logout', AuthController.logout);
 
 // Current User Profile (Protected)
@@ -365,6 +368,11 @@ apiRouter.delete(
 // Warehouse & Inventory Management System (Phase 04)
 // ==========================================
 apiRouter.use('/', wmsRouter);
+
+// ==========================================
+// Scoped Department Planning Module (Department Planner)
+// ==========================================
+apiRouter.use('/', planningRouter);
 
 // Automated Tests Runner (Restricted strictly to System Administrator)
 apiRouter.get(

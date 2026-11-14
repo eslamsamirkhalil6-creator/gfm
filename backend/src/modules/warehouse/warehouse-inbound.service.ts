@@ -1,4 +1,4 @@
-import { query, QueryFn, withTransaction } from '../../config/database.ts';
+import { query, QueryFn, sqlEqInt, sqlEqText, withTransaction } from '../../config/database.ts';
 import { hasGlobalWarehouseAccess } from '../../middleware/auth.middleware.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import { InventoryEngineService } from './inventory-engine.service.ts';
@@ -37,15 +37,15 @@ export class WarehouseInboundService {
     `;
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND g.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('g.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND g.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('g.status', `$${params.length}`)}`;
     }
     if (filter?.po_reference) {
       params.push(filter.po_reference);
-      sql += ` AND g.po_reference = $${params.length}`;
+      sql += ` AND ${sqlEqText('g.po_reference', `$${params.length}`)}`;
     }
     sql += ` ORDER BY g.id DESC`;
 
@@ -79,7 +79,7 @@ export class WarehouseInboundService {
        JOIN materials m ON gi.material_id = m.id
        JOIN warehouse_locations l ON gi.target_location_id = l.id
        LEFT JOIN inventory_lots lot ON gi.lot_id = lot.id
-       WHERE gi.grn_id + 0 = $1
+       WHERE ${sqlEqInt('gi.grn_id', '$1')}
        ORDER BY gi.id ASC`,
       [grnId]
     );
@@ -515,11 +515,11 @@ export class WarehouseInboundService {
       JOIN warehouse_locations l ON gi.target_location_id = l.id
       JOIN materials m ON gi.material_id = m.id
       LEFT JOIN inventory_lots lot ON gi.lot_id = lot.id
-      WHERE g.status = 'POSTED' AND gi.pending_inspection_qty > 0
+      WHERE ${sqlEqText('g.status', "'POSTED'")} AND gi.pending_inspection_qty > 0
     `;
     if (warehouseId) {
       params.push(warehouseId);
-      sql += ` AND gi.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('gi.warehouse_id', `$${params.length}`)}`;
     }
     sql += ` ORDER BY g.posted_at ASC, gi.id ASC`;
     const res = await query<any>(sql, params);
@@ -545,15 +545,15 @@ export class WarehouseInboundService {
     `;
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND qi.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('qi.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.material_id) {
       params.push(filter.material_id);
-      sql += ` AND qi.material_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('qi.material_id', `$${params.length}`)}`;
     }
     if (filter?.lot_id) {
       params.push(filter.lot_id);
-      sql += ` AND qi.lot_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('qi.lot_id', `$${params.length}`)}`;
     }
     sql += ` ORDER BY qi.inspected_at DESC, qi.id DESC`;
     const res = await query<any>(sql, params);
@@ -590,6 +590,10 @@ export class WarehouseInboundService {
       const itemRes = await txQuery<any>(`SELECT * FROM goods_receipt_items WHERE id = $1 FOR UPDATE`, [grnItemId]);
       if (itemRes.rowCount === 0) throw notFound(`GRN item #${grnItemId} not found`);
       const item = itemRes.rows[0];
+
+      if (!hasGlobalWarehouseAccess(actor as any) && !actor.managed_warehouse_ids.includes(item.warehouse_id)) {
+        throw forbidden(`Access denied. You are not assigned to Warehouse #${item.warehouse_id} for QC inspection.`);
+      }
 
       const grnRes = await txQuery<any>(`SELECT * FROM goods_receipts WHERE id = $1`, [item.grn_id]);
       const grn = grnRes.rows[0];
@@ -820,6 +824,209 @@ export class WarehouseInboundService {
       );
 
       return { inspection: inspectionRecord, movements, remaining_pending_qty: newPending, line_qc_status: lineOutcome };
+    });
+  }
+
+  /**
+   * QC Manager Senior Override (inventory:qc_override):
+   * Override stock between QUARANTINE / HOLD / DAMAGED and AVAILABLE / HOLD / DAMAGED / SCRAP
+   * with full qc_inspections traceability, ledger movements, and audit logging.
+   */
+  static async overrideQcStatus(
+    dto: {
+      warehouse_id: number;
+      location_id?: number | null;
+      target_location_id?: number | null;
+      material_id: number;
+      lot_id?: number | null;
+      from_stock_status: 'QUARANTINE' | 'HOLD' | 'DAMAGED';
+      to_stock_status?: 'AVAILABLE' | 'HOLD' | 'DAMAGED' | 'SCRAP';
+      quantity: number;
+      reason: string;
+    },
+    actor: WarehouseActor
+  ): Promise<any> {
+    const warehouseId = parsePositiveInt(dto.warehouse_id, 'warehouse_id');
+    const materialId = parsePositiveInt(dto.material_id, 'material_id');
+    const qty = parsePositiveNumber(dto.quantity, 'quantity');
+    const fromStatus = parseEnumValue(dto.from_stock_status, ['QUARANTINE', 'HOLD', 'DAMAGED'] as const, 'from_stock_status');
+    const toStatus = dto.to_stock_status
+      ? parseEnumValue(dto.to_stock_status, ['AVAILABLE', 'HOLD', 'DAMAGED', 'SCRAP'] as const, 'to_stock_status')
+      : 'AVAILABLE';
+    const reason = String(dto.reason || '').trim();
+    if (!reason) {
+      throw badRequest('Override reason is required', 'REASON_REQUIRED');
+    }
+    if (fromStatus === toStatus) {
+      throw badRequest('from_stock_status and to_stock_status must be different');
+    }
+
+    const lotId = dto.lot_id !== undefined && dto.lot_id !== null ? parsePositiveInt(dto.lot_id, 'lot_id') : null;
+
+    return withTransaction(async (txQuery) => {
+      if (!hasGlobalWarehouseAccess(actor as any) && !actor.managed_warehouse_ids.includes(warehouseId)) {
+        throw forbidden(`Access denied. You are not assigned to Warehouse #${warehouseId}.`);
+      }
+
+      const { location: sourceLoc } = await InventoryEngineService.resolveLocationForWarehouse(
+        txQuery,
+        warehouseId,
+        dto.location_id !== undefined && dto.location_id !== null ? parsePositiveInt(dto.location_id, 'location_id') : null
+      );
+
+      const { location: targetLoc } = await InventoryEngineService.resolveLocationForWarehouse(
+        txQuery,
+        warehouseId,
+        dto.target_location_id !== undefined && dto.target_location_id !== null
+          ? parsePositiveInt(dto.target_location_id, 'target_location_id')
+          : sourceLoc.id
+      );
+
+      const matRes = await txQuery<any>(`SELECT id, sku, name FROM materials WHERE id = $1`, [materialId]);
+      if (matRes.rowCount === 0) throw notFound(`Material #${materialId} not found`);
+
+      if (lotId !== null) {
+        const lotRes = await txQuery<any>(`SELECT id, material_id FROM inventory_lots WHERE id = $1 FOR UPDATE`, [lotId]);
+        if (lotRes.rowCount === 0) throw notFound(`Lot #${lotId} not found`);
+        if (lotRes.rows[0].material_id !== materialId) {
+          throw badRequest(`Lot #${lotId} does not belong to Material #${materialId}`);
+        }
+      }
+
+      let unitCost = await InventoryEngineService.getCurrentGlobalWac(txQuery, materialId);
+      if (fromStatus === 'QUARANTINE') {
+        const grnCostRes = await txQuery<{ unit_cost: string }>(
+          lotId !== null
+            ? `SELECT unit_cost FROM goods_receipt_items WHERE material_id = $1 AND lot_id = $2 ORDER BY id DESC LIMIT 1`
+            : `SELECT unit_cost FROM goods_receipt_items WHERE material_id = $1 ORDER BY id DESC LIMIT 1`,
+          lotId !== null ? [materialId, lotId] : [materialId]
+        );
+        if (grnCostRes.rowCount > 0 && Number(grnCostRes.rows[0].unit_cost) > 0) {
+          unitCost = roundQty(Number(grnCostRes.rows[0].unit_cost));
+        }
+      }
+
+      const overrideNumber = generateDocRef('QCO');
+      const isPass = toStatus === 'AVAILABLE';
+      const movementType = isPass ? 'QC_RELEASE' : 'QC_REJECT';
+
+      const qcIns = await txQuery<any>(
+        `INSERT INTO qc_inspections (
+           inspection_number, grn_item_id, lot_id, warehouse_id, location_id, material_id,
+           inspected_qty, passed_qty, rejected_qty, damaged_qty, outcome_status, inspector_id, notes
+         ) VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING *`,
+        [
+          overrideNumber,
+          lotId,
+          warehouseId,
+          sourceLoc.id,
+          materialId,
+          qty,
+          isPass ? qty : 0,
+          toStatus === 'HOLD' || toStatus === 'SCRAP' ? qty : 0,
+          toStatus === 'DAMAGED' ? qty : 0,
+          isPass ? 'PASSED' : 'REJECTED',
+          actor.id,
+          `[QC MANAGER OVERRIDE: ${fromStatus} -> ${toStatus}] ${reason}`,
+        ]
+      );
+      const inspectionRecord = qcIns.rows[0];
+
+      const outMv = await InventoryEngineService.applyBalanceChange(txQuery, {
+        warehouseId,
+        locationId: sourceLoc.id,
+        materialId,
+        lotId,
+        stockStatus: fromStatus,
+        direction: 'OUT',
+        movementType,
+        quantity: qty,
+        unitCost,
+        sourceWarehouseId: warehouseId,
+        sourceLocationId: sourceLoc.id,
+        destinationWarehouseId: warehouseId,
+        destinationLocationId: targetLoc.id,
+        sourceDocumentType: 'QC_OVERRIDE',
+        sourceDocumentId: inspectionRecord.id,
+        sourceDocumentRef: overrideNumber,
+        actorId: actor.id,
+        notes: `QC Manager override OUT (${fromStatus} -> ${toStatus}): ${reason}`,
+      });
+
+      const inMv = await InventoryEngineService.applyBalanceChange(txQuery, {
+        warehouseId,
+        locationId: targetLoc.id,
+        materialId,
+        lotId,
+        stockStatus: toStatus,
+        direction: 'IN',
+        movementType,
+        quantity: qty,
+        unitCost,
+        sourceWarehouseId: warehouseId,
+        sourceLocationId: sourceLoc.id,
+        destinationWarehouseId: warehouseId,
+        destinationLocationId: targetLoc.id,
+        sourceDocumentType: 'QC_OVERRIDE',
+        sourceDocumentId: inspectionRecord.id,
+        sourceDocumentRef: overrideNumber,
+        linkedMovementId: outMv.movement.id,
+        actorId: actor.id,
+        notes: `QC Manager override IN (${fromStatus} -> ${toStatus}): ${reason}`,
+      });
+
+      if (fromStatus === 'QUARANTINE' && toStatus === 'AVAILABLE' && unitCost > 0) {
+        await InventoryEngineService.applyGlobalWacInbound(txQuery, {
+          materialId,
+          incomingQty: qty,
+          incomingUnitCost: unitCost,
+        });
+      }
+
+      if (lotId !== null) {
+        const lotRes = await txQuery<{ remaining_qty: string }>(`SELECT remaining_qty FROM inventory_lots WHERE id = $1 FOR UPDATE`, [lotId]);
+        const currentLotRem = roundQty(Number(lotRes.rows[0]?.remaining_qty || 0));
+        let nextLotRem = currentLotRem;
+        if (isPass && fromStatus === 'DAMAGED') {
+          nextLotRem = roundQty(currentLotRem + qty);
+        } else if (!isPass && fromStatus === 'QUARANTINE') {
+          nextLotRem = roundQty(Math.max(0, currentLotRem - qty));
+        }
+        await txQuery(
+          `UPDATE inventory_lots
+           SET qc_status = $1, remaining_qty = $2, updated_at = NOW()
+           WHERE id = $3`,
+          [isPass ? 'PASSED' : 'REJECTED', nextLotRem, lotId]
+        );
+      }
+
+      await AuditService.log(
+        {
+          userId: actor.id,
+          action: 'WMS_QC_OVERRIDE',
+          entityType: 'QC_INSPECTION',
+          entityId: inspectionRecord.id,
+          details: {
+            inspection_number: overrideNumber,
+            warehouse_id: warehouseId,
+            material_id: materialId,
+            lot_id: lotId,
+            from_stock_status: fromStatus,
+            to_stock_status: toStatus,
+            quantity: qty,
+            reason,
+          },
+          ipAddress: actor.ipAddress,
+        },
+        txQuery
+      );
+
+      return {
+        inspection: inspectionRecord,
+        movements: [outMv.movement, inMv.movement],
+        balance: inMv.balance,
+      };
     });
   }
 

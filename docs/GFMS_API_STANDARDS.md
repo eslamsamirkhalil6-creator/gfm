@@ -7,7 +7,7 @@
 
 ## 1. Backward Compatibility Policy
 
-Existing endpoints under `/api/*` MUST NOT break active frontend consumers or automated tests (`#1`–`#74+`). Changes to legacy controllers (`DepartmentController`, `ProductionController`, `UserController`) to match these standards must be additive (preserving `success`, `data`, `message` fields while standardizing `error: { code, message, details }`).
+Existing endpoints under `/api/*` MUST NOT break active frontend consumers or automated tests (`#1`–`#79+`). Changes to legacy controllers (`DepartmentController`, `ProductionController`, `UserController`) to match these standards must be additive (preserving `success`, `data`, `message` fields while standardizing `error: { code, message, details }`).
 
 ---
 
@@ -112,9 +112,10 @@ All middleware, controllers, and global `errorHandler` MUST return:
    `authenticateJWT` → `requirePermission(...)` / `requireAnyPermission(...)` → `require<Domain>Scope(...)` → `validateBody(...)` → Controller → Service defense-in-depth checks.
 2. **Scope Enforcement Rules**:
    - **No Frontend Security Assumption**: UI visibility never replaces backend route + service checks.
-   - **Default Deny**: Scoped roles (`Department Manager`, `Warehouse Manager`, `Warehouse Keeper`, Line Supervisor) are denied (`403`) whenever scope cannot be verified authoritatively against database ownership tables (`departments.manager_id`, active `warehouse_staff` effective window, `production_lines.supervisor_id`).
+   - **No Role-Name Permission Bypasses**: Scope middleware must require explicit permission keys (e.g., `departments:scoped:view` vs `departments:scoped:manage`, `planning:view` vs `planning:manage`) alongside authoritative DB ownership rather than trusting role-name membership alone.
+   - **Default Deny**: Scoped roles (`Department Manager`, `Department Planner`, `Warehouse Manager`, `Warehouse Keeper`, Line Supervisor) are denied (`403`) whenever scope cannot be verified authoritatively against database ownership tables (`departments.manager_id`, `department_employees` planning scope, active `warehouse_staff` effective window, `production_lines.supervisor_id`).
    - **Data Masking**: Sensitive financial/HR fields (e.g., `weighted_avg_cost`, `total_inventory_value`, future payroll/evaluation fields) MUST be stripped at the service projection layer unless the caller holds the dedicated valuation/HR permission.
-   - **System Administrator Operational Segregation**: Administrative setup permissions (`users:*`, `roles:*`, `warehouse:manage`, `warehouse:settings:manage`) are strictly decoupled from operational execution and financial/quality approvals.
+   - **System Administrator Operational Segregation**: Administrative setup permissions (`users:*`, `roles:*`, `warehouse:manage`, `warehouse:settings:manage`) are strictly decoupled from operational execution, department manager impersonation, and financial/quality approvals.
 
 ---
 

@@ -11,6 +11,8 @@ import { ArchitectureExportPage } from './pages/ArchitectureExportPage.tsx';
 import { ProductionModule } from './pages/production/ProductionModule.tsx';
 import { DepartmentModule } from './pages/departments/DepartmentModule.tsx';
 import { MyDepartmentPage } from './pages/MyDepartmentPage.tsx';
+import { PlanningPage } from './pages/PlanningPage.tsx';
+import { WarehouseModule } from './pages/warehouse/WarehouseModule.tsx';
 import { HealthCheckData } from './types/index.ts';
 import { ApiService } from './services/api.ts';
 
@@ -56,20 +58,35 @@ const MainLayout: React.FC = () => {
   }
 
   // Fallback to dashboard if navigating to unauthorized tab
+  const canViewWarehouse =
+    hasPermission('warehouse:view') ||
+    hasPermission('inventory:requisition:create') ||
+    hasPermission('inventory:qc_inspect') ||
+    hasPermission('inventory:return');
   const canViewProduction = hasPermission('production:view');
   const canViewDepartments = hasPermission('departments:view');
+  const canViewPlanning = hasPermission('planning:view') || hasPermission('planning:manage');
   const canViewUsers = hasPermission('users:read');
   const canViewAudit = hasPermission('audit:read');
-  const isDeptManager = (user.managed_department_ids && user.managed_department_ids.length > 0) || false;
   const isSysAdmin = user.roles.includes('System Administrator');
   const isFactoryManager = user.roles.includes('Factory Manager');
+  const isDeptManager =
+    user.roles.includes('Department Manager') &&
+    !isFactoryManager &&
+    !isSysAdmin &&
+    (hasPermission('departments:scoped:view') || hasPermission('departments:scoped:manage')) &&
+    Boolean(user.managed_department_ids && user.managed_department_ids.length > 0);
 
   const currentTab =
-    activeTab === 'production' && !canViewProduction
+    activeTab === 'warehouse' && !canViewWarehouse
+      ? 'dashboard'
+      : activeTab === 'production' && !canViewProduction
       ? 'dashboard'
       : activeTab === 'departments' && !canViewDepartments
       ? 'dashboard'
       : activeTab === 'my-department' && !isDeptManager
+      ? 'dashboard'
+      : activeTab === 'planning' && !canViewPlanning
       ? 'dashboard'
       : activeTab === 'users' && !canViewUsers
       ? 'dashboard'
@@ -95,9 +112,11 @@ const MainLayout: React.FC = () => {
         {currentTab === 'dashboard' && (
           <DashboardPage health={health} setActiveTab={setActiveTab} />
         )}
+        {currentTab === 'warehouse' && canViewWarehouse && <WarehouseModule />}
         {currentTab === 'production' && canViewProduction && <ProductionModule />}
         {currentTab === 'departments' && canViewDepartments && <DepartmentModule />}
         {currentTab === 'my-department' && isDeptManager && <MyDepartmentPage />}
+        {currentTab === 'planning' && canViewPlanning && <PlanningPage />}
         {currentTab === 'users' && canViewUsers && <UsersManagementPage />}
         {currentTab === 'audit' && canViewAudit && <AuditLogsPage />}
         {currentTab === 'diagnostics' && isSysAdmin && <DiagnosticsPage />}
@@ -107,7 +126,7 @@ const MainLayout: React.FC = () => {
       {/* Industrial Footer */}
       <footer className="bg-slate-900/60 border-t border-slate-800/80 py-4 text-center text-xs text-slate-500 font-mono">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>GFMS v0.3 • Production & Department Management System • PostgreSQL Relational Architecture</span>
+          <span>GFMS v0.3 • Warehouse, Production &amp; Department Management System • PostgreSQL Relational Architecture</span>
           <span>REST API Base: /api • Authenticated via JWT</span>
         </div>
       </footer>

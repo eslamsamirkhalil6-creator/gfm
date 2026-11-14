@@ -101,6 +101,12 @@ wmsRouter.delete(
 
 wmsRouter.get('/warehouse/settings', requirePermission('warehouse:view'), WarehouseController.getSettings);
 
+wmsRouter.get(
+  '/warehouse/departments',
+  requireAnyPermission('warehouse:view', 'inventory:requisition:create', 'inventory:return'),
+  WarehouseController.listDepartmentsForWarehouseOps
+);
+
 wmsRouter.put(
   '/warehouse/settings/:key',
   requirePermission('warehouse:settings:manage'),
@@ -180,7 +186,7 @@ wmsRouter.get(
 );
 wmsRouter.get(
   '/inventory/lots',
-  requirePermission('warehouse:view'),
+  requireAnyPermission('warehouse:view', 'inventory:return'),
   requireWarehouseScope({ optional: true }),
   WarehouseController.getLots
 );
@@ -244,6 +250,12 @@ wmsRouter.post(
   requirePermission('inventory:qc_inspect'),
   validateBody(['grn_item_id', 'passed_qty']),
   WarehouseController.performQcInspection
+);
+wmsRouter.post(
+  '/warehouse/qc/override',
+  requirePermission('inventory:qc_override'),
+  validateBody(['warehouse_id', 'material_id', 'from_stock_status', 'quantity', 'reason']),
+  WarehouseController.overrideQcStatus
 );
 
 // ============================================================================

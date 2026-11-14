@@ -62,17 +62,17 @@ export const LoginPage: React.FC<LoginPageProps> = ({ health }) => {
           Garment Factory Management System
         </h1>
         <p className="mt-1 text-xs text-indigo-400 font-mono font-medium uppercase tracking-wider">
-          GFMS Technical Foundation Prototype v0.1
+          GFMS v0.3 • Factory Operations &amp; WMS
         </p>
       </div>
 
       {/* Main Login Card */}
-      <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md px-4 sm:px-0">
+      <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-lg px-4 sm:px-0">
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 sm:p-8 shadow-2xl">
           <div className="mb-6">
             <h2 className="text-base font-semibold text-white">System Authentication</h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Enter your factory credentials or select a sample role below
+              Enter your factory credentials or select a UAT role below
             </p>
           </div>
 
@@ -95,7 +95,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ health }) => {
                   required
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="admin, manager, or deptuser"
+                  placeholder="admin, manager, whmanager, qcmanager..."
                   className="w-full bg-slate-950 border border-slate-700 rounded-md pl-9 pr-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-hidden focus:border-indigo-500"
                 />
               </div>
@@ -138,73 +138,77 @@ export const LoginPage: React.FC<LoginPageProps> = ({ health }) => {
           </form>
 
           {/* Quick-Fill Preset Buttons */}
-          <div className="mt-6 pt-5 border-t border-slate-800">
-            <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-2.5">
-              Quick Test Credentials:
+          <div className="mt-6 pt-5 border-t border-slate-800 space-y-3">
+            <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+              Quick Test Credentials (Core &amp; Department Roles):
             </p>
-            <div className="space-y-2">
-              <button
-                type="button"
-                onClick={() => fillCredentials('admin', 'Admin@123')}
-                className="w-full text-left p-2.5 rounded-lg bg-slate-950 border border-slate-800 hover:border-indigo-600/60 hover:bg-slate-800/40 transition-colors flex items-center justify-between group"
-              >
-                <div>
-                  <div className="flex items-center space-x-1.5">
-                    <span className="text-xs font-medium text-slate-200 group-hover:text-white">
-                      System Administrator
-                    </span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-400 border border-indigo-800/40 font-mono">
-                      admin
-                    </span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {[
+                { label: 'System Admin', u: 'admin', p: 'Admin@123', desc: 'Full control & tests', badge: 'bg-indigo-950 text-indigo-400 border-indigo-800/40' },
+                { label: 'Factory Manager', u: 'manager', p: 'Manager@123', desc: 'Factory overview & approvals', badge: 'bg-emerald-950 text-emerald-400 border-emerald-800/40' },
+                { label: 'Dept Manager (CUT)', u: 'deptuser', p: 'Dept@123', desc: 'DEP-CUT + scoped planning', badge: 'bg-indigo-950 text-indigo-300 border-indigo-800/40' },
+                { label: 'Dept Planner (PPC)', u: 'planner', p: 'Planner@123', desc: 'Scoped planning schedules', badge: 'bg-amber-950 text-amber-300 border-amber-800/40' },
+                { label: 'Dept User (Basic)', u: 'deptstaff', p: 'Staff@123', desc: 'Basic station view only', badge: 'bg-sky-950 text-sky-400 border-sky-800/40' },
+              ].map((acc) => (
+                <button
+                  key={acc.u}
+                  type="button"
+                  onClick={() => fillCredentials(acc.u, acc.p)}
+                  className="w-full text-left p-2 rounded-lg bg-slate-950 border border-slate-800 hover:border-indigo-600/60 hover:bg-slate-800/40 transition-colors flex items-center justify-between group cursor-pointer"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center space-x-1.5">
+                      <span className="text-xs font-medium text-slate-200 group-hover:text-white truncate">
+                        {acc.label}
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${acc.badge}`}>
+                        {acc.u}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 truncate">{acc.desc}</p>
                   </div>
-                  <p className="text-[11px] text-slate-500">Full control, user management, audit review</p>
-                </div>
-                <span className="text-xs text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity">
-                  Fill →
-                </span>
-              </button>
+                  <span className="text-[11px] text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 ml-1">
+                    →
+                  </span>
+                </button>
+              ))}
+            </div>
 
-              <button
-                type="button"
-                onClick={() => fillCredentials('manager', 'Manager@123')}
-                className="w-full text-left p-2.5 rounded-lg bg-slate-950 border border-slate-800 hover:border-indigo-600/60 hover:bg-slate-800/40 transition-colors flex items-center justify-between group"
-              >
-                <div>
-                  <div className="flex items-center space-x-1.5">
-                    <span className="text-xs font-medium text-slate-200 group-hover:text-white">
-                      Factory Manager
-                    </span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/40 font-mono">
-                      manager
-                    </span>
+            <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider pt-2">
+              Warehouse, QC, Production &amp; Procurement UAT Accounts:
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {[
+                { label: 'Warehouse Manager', u: 'whmanager', p: 'Warehouse@123', desc: 'WH-RAW & WH-TRIM scope', badge: 'bg-indigo-950 text-indigo-300 border-indigo-800/40' },
+                { label: 'Warehouse Keeper', u: 'whkeeper', p: 'Keeper@123', desc: 'WH-RAW/TRIM GRN & Issue', badge: 'bg-sky-950 text-sky-300 border-sky-800/40' },
+                { label: 'QC Manager', u: 'qcmanager', p: 'QcMgr@123', desc: 'QC queue + override', badge: 'bg-emerald-950 text-emerald-300 border-emerald-800/40' },
+                { label: 'QC Inspector', u: 'qcinspector', p: 'Qc@123', desc: 'Scoped WH-RAW inspection', badge: 'bg-amber-950 text-amber-300 border-amber-800/40' },
+                { label: 'Purchasing Mgr', u: 'purchasing', p: 'Purch@123', desc: 'Reorders, GRNs & valuation', badge: 'bg-purple-950 text-purple-300 border-purple-800/40' },
+                { label: 'Production Mgr', u: 'prodmanager', p: 'ProdMgr@123', desc: 'Prod view + requisitions', badge: 'bg-teal-950 text-teal-300 border-teal-800/40' },
+                { label: 'Finance Viewer', u: 'finance', p: 'Finance@123', desc: 'Valuation & audit reports', badge: 'bg-slate-800 text-slate-300 border-slate-700' },
+              ].map((acc) => (
+                <button
+                  key={acc.u}
+                  type="button"
+                  onClick={() => fillCredentials(acc.u, acc.p)}
+                  className="w-full text-left p-2 rounded-lg bg-slate-950 border border-slate-800 hover:border-indigo-600/60 hover:bg-slate-800/40 transition-colors flex items-center justify-between group cursor-pointer"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center space-x-1.5">
+                      <span className="text-xs font-medium text-slate-200 group-hover:text-white truncate">
+                        {acc.label}
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${acc.badge}`}>
+                        {acc.u}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 truncate">{acc.desc}</p>
                   </div>
-                  <p className="text-[11px] text-slate-500">Floor dashboard & workforce viewing</p>
-                </div>
-                <span className="text-xs text-emerald-400 opacity-0 group-hover:opacity-100 transition-opacity">
-                  Fill →
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => fillCredentials('deptuser', 'Dept@123')}
-                className="w-full text-left p-2.5 rounded-lg bg-slate-950 border border-slate-800 hover:border-indigo-600/60 hover:bg-slate-800/40 transition-colors flex items-center justify-between group"
-              >
-                <div>
-                  <div className="flex items-center space-x-1.5">
-                    <span className="text-xs font-medium text-slate-200 group-hover:text-white">
-                      Department User
-                    </span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-sky-950 text-sky-400 border border-sky-800/40 font-mono">
-                      deptuser
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-500">Restricted basic operational view only</p>
-                </div>
-                <span className="text-xs text-sky-400 opacity-0 group-hover:opacity-100 transition-opacity">
-                  Fill →
-                </span>
-              </button>
+                  <span className="text-[11px] text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 ml-1">
+                    →
+                  </span>
+                </button>
+              ))}
             </div>
           </div>
         </div>

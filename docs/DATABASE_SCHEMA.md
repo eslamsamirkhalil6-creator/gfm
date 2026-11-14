@@ -270,7 +270,7 @@ Managed automatically by `backend/src/config/migrations.ts` during server startu
 
 ## 6. Independent Warehouse Management System Tables (`005_create_warehouse_tables.sql`)
 
-Adds 24 relational tables supporting Phase 02 approved decisions (`DEC-01`..`DEC-12`, `PARAM-01`..`PARAM-04`). Total GFMS table count: `15 (legacy 001–004) + 1 (schema_migrations) + 24 (WMS 005) = 40 tables`.
+Adds 24 relational tables supporting Phase 02 approved decisions (`DEC-01`..`DEC-12`, `PARAM-01`..`PARAM-04`). Subsequent `006_rbac_role_clarification.sql` adds `department_planning_schedules` (1 table). Phase 07 (`007_seed_phase07_rbac_hardening.sql`) introduced RBAC/UAT seed updates with **zero schema DDL changes**. Total GFMS table count: `15 (legacy 001–004) + 1 (schema_migrations) + 24 (WMS 005) + 1 (department_planning_schedules 006) = 41 tables`.
 
 ### 6.1 Conceptual Module Map
 

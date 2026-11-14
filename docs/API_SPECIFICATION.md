@@ -286,8 +286,31 @@ Permanently deletes an empty, unused department. Strictly blocked if the departm
 
 ---
 
-## 7. Warehouse & Inventory Management System (WMS – GFMS v0.3)
+## 8. Department Planning Module (Phase 05 / 07)
 
-All Warehouse, Material Catalog, GRN, QC Inspection, Requisition, Issuing, Return, Transfer, Stock Count, Adjustment, Reorder, Finished Goods Receiving, Valuation, and Notification endpoints (`/api/warehouses/*`, `/api/warehouse/*`, `/api/inventory/*`) are documented in detail in:
+### `GET /api/planning/schedules`
+Lists department planning schedules filtered by `managed_department_ids` for scoped roles (`Department Planner`, `Department Manager`) or read-only factory-wide visibility for `Factory Manager`.
+- **Permission Required:** `planning:view` *(System Administrator blocked with `403 FORBIDDEN`)*
+
+### `POST /api/planning/schedules` / `PUT /api/planning/schedules/:id` / `DELETE /api/planning/schedules/:id`
+Creates, updates, or deletes schedules within `managed_department_ids`.
+- **Permission Required:** `planning:manage` + Department Scope *(Factory Manager & Department Manager blocked `403` from mutations)*
+
+---
+
+## 9. Warehouse & Inventory Management System (WMS – GFMS v0.3)
+
+All Warehouse, Material Catalog, GRN, QC Inspection & Senior Override, Requisition, Issuing, Return, Transfer, Stock Count, Adjustment, Reorder, Finished Goods Receiving, Valuation, Reconciliation, and Notification endpoints (`/api/warehouses/*`, `/api/warehouse/*`, `/api/inventory/*`) are documented in detail in:
 
 - [`docs/WMS_API_SPECIFICATION.md`](./WMS_API_SPECIFICATION.md)
+
+---
+
+## 10. Phase 07 Platform Security & Error Standardization
+
+- **Standardized Error Format**: All modules (Auth, Users, Roles, Departments, Production, Planning, WMS, Audit) emit `{ "success": false, "error": { "code": "<ERROR_CODE>", "message": "..." } }` via `AppError` and centralized error middleware (`error.middleware.ts`), along with HTTP status codes `400`, `401`, `403`, `404`, `409`, and `429`.
+- **Login Rate Limiting**: `POST /api/auth/login` enforces per-IP + username sliding-window throttling (`429 RATE_LIMIT_EXCEEDED`).
+- **Strict CORS & Security Headers**: Production mode rejects wildcard origins and requires explicit `CORS_ORIGIN` and `JWT_SECRET` environment configuration (`403 CORS_FORBIDDEN` for unauthorized cross-origin requests).
+- **Administrative Integrity Guards**: `PUT /api/users/:id/status` and `PUT /api/users/:id/roles` enforce `400 SELF_DEACTIVATION_FORBIDDEN` and `409 LAST_ADMIN_PROTECTION`.
+- **Transactional Atomicity**: Multi-step mutations (user/role updates, department manager tenure transitions, workflow step reordering via `PUT /api/production/workflows/:id/steps`, notification read updates, and all stock movements) execute inside `withTransaction`.
+

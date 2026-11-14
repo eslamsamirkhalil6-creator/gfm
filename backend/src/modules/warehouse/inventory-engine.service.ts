@@ -1,4 +1,4 @@
-import { query, QueryFn } from '../../config/database.ts';
+import { query, QueryFn, sqlEqInt } from '../../config/database.ts';
 import {
   badRequest,
   conflict,
@@ -324,8 +324,8 @@ export class InventoryEngineService {
               b.qty_on_hand, b.qty_reserved, b.qty_available, l.received_at
        FROM inventory_balances b
        LEFT JOIN inventory_lots l ON b.lot_id = l.id
-       WHERE b.warehouse_id + 0 = $1
-         AND b.material_id + 0 = $2
+       WHERE ${sqlEqInt('b.warehouse_id', '$1')}
+         AND ${sqlEqInt('b.material_id', '$2')}
          AND b.stock_status = 'AVAILABLE'
          AND b.qty_on_hand > b.qty_reserved
        FOR UPDATE`,
@@ -384,8 +384,8 @@ export class InventoryEngineService {
     const reservedRes = await txQuery<BalanceRow>(
       `SELECT id, qty_reserved
        FROM inventory_balances
-       WHERE warehouse_id + 0 = $1
-         AND material_id + 0 = $2
+       WHERE ${sqlEqInt('warehouse_id', '$1')}
+         AND ${sqlEqInt('material_id', '$2')}
          AND stock_status = 'AVAILABLE'
          AND qty_reserved > 0
        ORDER BY id ASC
@@ -606,7 +606,7 @@ export class InventoryEngineService {
     const balRes = await txQuery<{ total_avail: string }>(
       `SELECT COALESCE(SUM(qty_available), 0) as total_avail
        FROM inventory_balances
-       WHERE warehouse_id + 0 = $1 AND material_id + 0 = $2 AND stock_status = 'AVAILABLE'`,
+       WHERE ${sqlEqInt('warehouse_id', '$1')} AND ${sqlEqInt('material_id', '$2')} AND stock_status = 'AVAILABLE'`,
       [warehouseId, materialId]
     );
     const totalAvail = roundQty(Number(balRes.rows[0]?.total_avail || 0));
@@ -614,7 +614,7 @@ export class InventoryEngineService {
     if (totalAvail <= reorderLevel) {
       const existingUnread = await txQuery<{ cnt: string }>(
         `SELECT count(*) as cnt FROM warehouse_notifications
-         WHERE warehouse_id + 0 = $1
+         WHERE ${sqlEqInt('warehouse_id', '$1')}
            AND entity_type = 'MATERIAL'
            AND entity_id = $2
            AND notification_type = 'LOW_STOCK'
@@ -638,12 +638,21 @@ export class InventoryEngineService {
 
   /**
    * Reconcile inventory_balances total qty_on_hand vs stock_movements net sum across (warehouse, material).
+   * Always executes uncached live ledger aggregation so discrepancies are never masked.
    */
   static async reconcileBalancesVsMovements(filter?: {
     warehouseId?: number;
     materialId?: number;
   }): Promise<{
     isBalanced: boolean;
+    scope: {
+      mode: 'FULL' | 'WAREHOUSE' | 'MATERIAL' | 'WAREHOUSE_MATERIAL';
+      warehouse_id: number | null;
+      material_id: number | null;
+    };
+    checked_pairs_count: number;
+    execution_time_ms: number;
+    reconciled_at: string;
     discrepancies: Array<{
       warehouse_id: number;
       material_id: number;
@@ -652,19 +661,22 @@ export class InventoryEngineService {
       variance: number;
     }>;
   }> {
+    const startedAt = Date.now();
     const params: any[] = [];
     const balConds: string[] = [];
     const movConds: string[] = [];
 
     if (filter?.warehouseId) {
       params.push(filter.warehouseId);
-      balConds.push(`warehouse_id = $${params.length}`);
-      movConds.push(`warehouse_id = $${params.length}`);
+      const whPred = sqlEqInt('warehouse_id', `$${params.length}`);
+      balConds.push(whPred);
+      movConds.push(whPred);
     }
     if (filter?.materialId) {
       params.push(filter.materialId);
-      balConds.push(`material_id = $${params.length}`);
-      movConds.push(`material_id = $${params.length}`);
+      const matPred = sqlEqInt('material_id', `$${params.length}`);
+      balConds.push(matPred);
+      movConds.push(matPred);
     }
 
     const balWhere = balConds.length ? `WHERE ${balConds.join(' AND ')}` : '';
@@ -725,8 +737,25 @@ export class InventoryEngineService {
       }
     }
 
+    const mode =
+      filter?.warehouseId && filter?.materialId
+        ? 'WAREHOUSE_MATERIAL'
+        : filter?.warehouseId
+          ? 'WAREHOUSE'
+          : filter?.materialId
+            ? 'MATERIAL'
+            : 'FULL';
+
     return {
       isBalanced: discrepancies.length === 0,
+      scope: {
+        mode,
+        warehouse_id: filter?.warehouseId ?? null,
+        material_id: filter?.materialId ?? null,
+      },
+      checked_pairs_count: keySet.size,
+      execution_time_ms: Date.now() - startedAt,
+      reconciled_at: new Date().toISOString(),
       discrepancies,
     };
   }

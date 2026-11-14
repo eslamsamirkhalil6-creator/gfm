@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { query } from '../../config/database.ts';
+import { query, withTransaction } from '../../config/database.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import { CreateUserInput, RoleDto, UserDto } from './user.types.ts';
 
@@ -52,7 +52,7 @@ export class UserService {
   }
 
   /**
-   * Create a new user with secure password hash and assigned roles.
+   * Create a new user with secure password hash and assigned roles inside an atomic transaction.
    */
   static async createUser(
     input: CreateUserInput,
@@ -69,6 +69,13 @@ export class UserService {
       throw err;
     }
 
+    if (!fullName) {
+      const err: any = new Error('Full name is required');
+      err.statusCode = 400;
+      err.code = 'VALIDATION_ERROR';
+      throw err;
+    }
+
     if (!input.password || input.password.length < 6) {
       const err: any = new Error('Password must be at least 6 characters long');
       err.statusCode = 400;
@@ -76,89 +83,95 @@ export class UserService {
       throw err;
     }
 
-    // Check unique username
-    const existing = await query(`SELECT id FROM users WHERE username = $1`, [username]);
-    if (existing.rowCount > 0) {
-      const err: any = new Error(`Username "${username}" is already in use`);
-      err.statusCode = 409;
-      err.code = 'USERNAME_EXISTS';
-      throw err;
-    }
-
-    // Hash password with bcrypt
+    const roleIds = input.roleIds && input.roleIds.length > 0 ? input.roleIds : [3];
     const passwordHash = await bcrypt.hash(input.password, 10);
 
-    // Insert user
-    const insertRes = await query<{
-      id: number;
-      username: string;
-      full_name: string;
-      is_active: boolean;
-      created_at: string;
-    }>(
-      `INSERT INTO users (username, password_hash, full_name, is_active, created_at)
-       VALUES ($1, $2, $3, TRUE, NOW())
-       RETURNING id, username, full_name, is_active, created_at`,
-      [username, passwordHash, fullName]
-    );
+    return withTransaction(async (txQuery) => {
+      const existing = await txQuery(`SELECT id FROM users WHERE username = $1`, [username]);
+      if (existing.rowCount > 0) {
+        const err: any = new Error(`Username "${username}" is already in use`);
+        err.statusCode = 409;
+        err.code = 'USERNAME_EXISTS';
+        throw err;
+      }
 
-    const newUser = insertRes.rows[0];
-
-    // Assign roles if provided
-    const assignedRoles: { id: number; role_name: string }[] = [];
-    const roleIds = input.roleIds && input.roleIds.length > 0 ? input.roleIds : [3]; // Default to Department User (id: 3)
-
-    for (const rId of roleIds) {
-      const roleCheck = await query<{ id: number; role_name: string }>(
-        `SELECT id, role_name FROM roles WHERE id = $1`,
-        [rId]
+      const insertRes = await txQuery<{
+        id: number;
+        username: string;
+        full_name: string;
+        is_active: boolean;
+        created_at: string;
+      }>(
+        `INSERT INTO users (username, password_hash, full_name, is_active, created_at)
+         VALUES ($1, $2, $3, TRUE, NOW())
+         RETURNING id, username, full_name, is_active, created_at`,
+        [username, passwordHash, fullName]
       );
-      if (roleCheck.rowCount > 0) {
-        await query(
+
+      const newUser = insertRes.rows[0];
+      const assignedRoles: { id: number; role_name: string }[] = [];
+
+      for (const rId of roleIds) {
+        const roleCheck = await txQuery<{ id: number; role_name: string }>(
+          `SELECT id, role_name FROM roles WHERE id = $1`,
+          [rId]
+        );
+        if (roleCheck.rowCount === 0) {
+          const err: any = new Error(`Role ID #${rId} not found`);
+          err.statusCode = 404;
+          err.code = 'NOT_FOUND';
+          throw err;
+        }
+        await txQuery(
           `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
           [newUser.id, rId]
         );
         assignedRoles.push(roleCheck.rows[0]);
       }
-    }
 
-    // Audit logs
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'USER_CREATE',
-      entityType: 'USER',
-      entityId: newUser.id,
-      details: {
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'USER_CREATE',
+          entityType: 'USER',
+          entityId: newUser.id,
+          details: {
+            username: newUser.username,
+            full_name: newUser.full_name,
+            assignedRoleIds: roleIds,
+          },
+          ipAddress,
+        },
+        txQuery
+      );
+
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'ROLE_ASSIGN',
+          entityType: 'USER_ROLES',
+          entityId: newUser.id,
+          details: {
+            roles: assignedRoles.map(r => r.role_name),
+          },
+          ipAddress,
+        },
+        txQuery
+      );
+
+      return {
+        id: newUser.id,
         username: newUser.username,
         full_name: newUser.full_name,
-        assignedRoleIds: roleIds,
-      },
-      ipAddress,
+        is_active: newUser.is_active,
+        created_at: newUser.created_at,
+        roles: assignedRoles,
+      };
     });
-
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'ROLE_ASSIGN',
-      entityType: 'USER_ROLES',
-      entityId: newUser.id,
-      details: {
-        roles: assignedRoles.map(r => r.role_name),
-      },
-      ipAddress,
-    });
-
-    return {
-      id: newUser.id,
-      username: newUser.username,
-      full_name: newUser.full_name,
-      is_active: newUser.is_active,
-      created_at: newUser.created_at,
-      roles: assignedRoles,
-    };
   }
 
   /**
-   * Update active status of a user
+   * Update active status of a user (protects against self-deactivation and deactivating last active System Administrator).
    */
   static async updateUserStatus(
     userId: number,
@@ -166,35 +179,73 @@ export class UserService {
     actorUserId?: number | null,
     ipAddress?: string
   ): Promise<void> {
-    const check = await query<{ id: number; username: string }>(
-      `SELECT id, username FROM users WHERE id = $1`,
-      [userId]
-    );
-
-    if (check.rowCount === 0) {
-      const err: any = new Error(`User with ID ${userId} not found`);
-      err.statusCode = 404;
-      err.code = 'NOT_FOUND';
+    if (!isActive && actorUserId && actorUserId === userId) {
+      const err: any = new Error('Administrators cannot deactivate their own active account');
+      err.statusCode = 400;
+      err.code = 'SELF_DEACTIVATION_FORBIDDEN';
       throw err;
     }
 
-    await query(`UPDATE users SET is_active = $1 WHERE id = $2`, [isActive, userId]);
+    await withTransaction(async (txQuery) => {
+      const check = await txQuery<{ id: number; username: string; is_active: boolean }>(
+        `SELECT id, username, is_active FROM users WHERE id = $1 FOR UPDATE`,
+        [userId]
+      );
 
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'USER_STATUS_UPDATE',
-      entityType: 'USER',
-      entityId: userId,
-      details: {
-        username: check.rows[0].username,
-        new_is_active: isActive,
-      },
-      ipAddress,
+      if (check.rowCount === 0) {
+        const err: any = new Error(`User with ID ${userId} not found`);
+        err.statusCode = 404;
+        err.code = 'NOT_FOUND';
+        throw err;
+      }
+
+      if (!isActive && check.rows[0].is_active) {
+        const targetIsAdmin = await txQuery<{ cnt: string }>(
+          `SELECT count(*) as cnt
+           FROM user_roles ur
+           JOIN roles r ON ur.role_id = r.id
+           WHERE ur.user_id = $1 AND r.role_name = 'System Administrator'`,
+          [userId]
+        );
+        if (parseInt(String(targetIsAdmin.rows[0]?.cnt || '0'), 10) > 0) {
+          const activeAdmins = await txQuery<{ cnt: string }>(
+            `SELECT count(DISTINCT u.id) as cnt
+             FROM users u
+             JOIN user_roles ur ON u.id = ur.user_id
+             JOIN roles r ON ur.role_id = r.id
+             WHERE r.role_name = 'System Administrator' AND u.is_active = TRUE AND u.id != $1`,
+            [userId]
+          );
+          if (parseInt(String(activeAdmins.rows[0]?.cnt || '0'), 10) === 0) {
+            const err: any = new Error('Cannot deactivate the last remaining active System Administrator');
+            err.statusCode = 409;
+            err.code = 'LAST_ADMIN_PROTECTION';
+            throw err;
+          }
+        }
+      }
+
+      await txQuery(`UPDATE users SET is_active = $1 WHERE id = $2`, [isActive, userId]);
+
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'USER_STATUS_UPDATE',
+          entityType: 'USER',
+          entityId: userId,
+          details: {
+            username: check.rows[0].username,
+            new_is_active: isActive,
+          },
+          ipAddress,
+        },
+        txQuery
+      );
     });
   }
 
   /**
-   * Update user roles
+   * Update user roles inside an atomic transaction (protects last active System Administrator).
    */
   static async updateUserRoles(
     userId: number,
@@ -202,42 +253,89 @@ export class UserService {
     actorUserId?: number | null,
     ipAddress?: string
   ): Promise<void> {
-    const check = await query<{ id: number; username: string }>(
-      `SELECT id, username FROM users WHERE id = $1`,
-      [userId]
-    );
-
-    if (check.rowCount === 0) {
-      const err: any = new Error(`User with ID ${userId} not found`);
-      err.statusCode = 404;
-      err.code = 'NOT_FOUND';
+    if (!Array.isArray(roleIds) || roleIds.length === 0) {
+      const err: any = new Error('At least one role ID must be assigned to the user');
+      err.statusCode = 400;
+      err.code = 'VALIDATION_ERROR';
       throw err;
     }
 
-    // Delete existing roles
-    await query(`DELETE FROM user_roles WHERE user_id = $1`, [userId]);
+    await withTransaction(async (txQuery) => {
+      const check = await txQuery<{ id: number; username: string }>(
+        `SELECT id, username FROM users WHERE id = $1 FOR UPDATE`,
+        [userId]
+      );
 
-    // Insert new roles
-    const assignedRoleNames: string[] = [];
-    for (const rId of roleIds) {
-      const roleCheck = await query<{ role_name: string }>(`SELECT role_name FROM roles WHERE id = $1`, [rId]);
-      if (roleCheck.rowCount > 0) {
-        await query(`INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)`, [userId, rId]);
+      if (check.rowCount === 0) {
+        const err: any = new Error(`User with ID ${userId} not found`);
+        err.statusCode = 404;
+        err.code = 'NOT_FOUND';
+        throw err;
+      }
+
+      const assignedRoleNames: string[] = [];
+      for (const rId of roleIds) {
+        const roleCheck = await txQuery<{ role_name: string }>(`SELECT role_name FROM roles WHERE id = $1`, [rId]);
+        if (roleCheck.rowCount === 0) {
+          const err: any = new Error(`Role ID #${rId} not found`);
+          err.statusCode = 404;
+          err.code = 'NOT_FOUND';
+          throw err;
+        }
         assignedRoleNames.push(roleCheck.rows[0].role_name);
       }
-    }
 
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'USER_ROLES_UPDATE',
-      entityType: 'USER_ROLES',
-      entityId: userId,
-      details: {
-        username: check.rows[0].username,
-        new_roles: assignedRoleNames,
-        roleIds,
-      },
-      ipAddress,
+      if (!assignedRoleNames.includes('System Administrator')) {
+        const otherActiveAdmins = await txQuery<{ cnt: string }>(
+          `SELECT count(DISTINCT u.id) as cnt
+           FROM users u
+           JOIN user_roles ur ON u.id = ur.user_id
+           JOIN roles r ON ur.role_id = r.id
+           WHERE r.role_name = 'System Administrator' AND u.is_active = TRUE AND u.id != $1`,
+          [userId]
+        );
+        const currentlyAdmin = await txQuery<{ cnt: string }>(
+          `SELECT count(*) as cnt
+           FROM user_roles ur
+           JOIN roles r ON ur.role_id = r.id
+           WHERE ur.user_id = $1 AND r.role_name = 'System Administrator'`,
+          [userId]
+        );
+        if (
+          parseInt(String(currentlyAdmin.rows[0]?.cnt || '0'), 10) > 0 &&
+          parseInt(String(otherActiveAdmins.rows[0]?.cnt || '0'), 10) === 0
+        ) {
+          const err: any = new Error('Cannot remove System Administrator role from the last active administrator');
+          err.statusCode = 409;
+          err.code = 'LAST_ADMIN_PROTECTION';
+          throw err;
+        }
+      }
+
+      await txQuery(`DELETE FROM user_roles WHERE user_id = $1`, [userId]);
+
+      for (const rId of roleIds) {
+        await txQuery(
+          `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+          [userId, rId]
+        );
+      }
+
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'USER_ROLES_UPDATE',
+          entityType: 'USER_ROLES',
+          entityId: userId,
+          details: {
+            username: check.rows[0].username,
+            new_roles: assignedRoleNames,
+            roleIds,
+          },
+          ipAddress,
+        },
+        txQuery
+      );
     });
   }
 

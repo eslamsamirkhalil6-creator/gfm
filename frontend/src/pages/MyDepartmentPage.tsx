@@ -28,8 +28,16 @@ import { AssignEmployeeModal } from './departments/AssignEmployeeModal.tsx';
 import { DepartmentFormModal } from './departments/DepartmentFormModal.tsx';
 
 export const MyDepartmentPage: React.FC = () => {
-  const { user, refreshUser } = useAuth();
+  const { user, hasPermission, hasRole } = useAuth();
   const managedIds = user?.managed_department_ids || [];
+  const isDeptManager =
+    hasRole('Department Manager') &&
+    !hasRole('Factory Manager') &&
+    !hasRole('System Administrator') &&
+    (hasPermission('departments:scoped:view') || hasPermission('departments:scoped:manage')) &&
+    managedIds.length > 0;
+  const canManageDept =
+    hasPermission('departments:scoped:manage') || hasPermission('departments:manage_employees');
 
   const [selectedDeptId, setSelectedDeptId] = useState<number | null>(
     user?.primary_department_id || (managedIds.length > 0 ? managedIds[0] : null)
@@ -75,7 +83,9 @@ export const MyDepartmentPage: React.FC = () => {
       const [deptDetail, depts, users] = await Promise.all([
         ApiService.getDepartmentById(selectedDeptId),
         ApiService.getDepartments().catch(() => []),
-        ApiService.getDepartmentAssignableUsers(selectedDeptId),
+        canManageDept
+          ? ApiService.getDepartmentAssignableUsers(selectedDeptId).catch(() => [])
+          : Promise.resolve([]),
       ]);
 
       setDepartmentData(deptDetail);
@@ -111,14 +121,13 @@ export const MyDepartmentPage: React.FC = () => {
     }
   };
 
-  if (managedIds.length === 0) {
+  if (!isDeptManager || managedIds.length === 0) {
     return (
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-8 text-center text-slate-400">
         <Building2 className="w-12 h-12 text-slate-600 mx-auto mb-3" />
-        <h2 className="text-base font-bold text-white mb-1">No Managed Department Assigned</h2>
+        <h2 className="text-base font-bold text-white mb-1">Department Manager Access Required</h2>
         <p className="text-xs text-slate-400 max-w-md mx-auto">
-          You are currently not recorded as the appointed manager of any factory department.
-          Department manager assignments must be configured by an administrator.
+          You must hold the Department Manager role with department-scoped permissions and an assigned managed department to open this workspace.
         </p>
       </div>
     );
@@ -182,7 +191,7 @@ export const MyDepartmentPage: React.FC = () => {
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-indigo-400' : ''}`} />
             </button>
 
-            {dept && (
+            {dept && canManageDept && (
               <button
                 onClick={() => setIsEditModalOpen(true)}
                 className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 flex items-center space-x-1.5 transition-colors cursor-pointer"
@@ -192,7 +201,7 @@ export const MyDepartmentPage: React.FC = () => {
               </button>
             )}
 
-            {dept && (
+            {dept && canManageDept && (
               <button
                 onClick={() => {
                   setTransferringEmployee(null);
@@ -289,13 +298,15 @@ export const MyDepartmentPage: React.FC = () => {
           <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
             Operational Scope &amp; Responsibilities
           </h2>
-          <button
-            onClick={() => setIsEditModalOpen(true)}
-            className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 cursor-pointer"
-          >
-            <Edit2 className="w-3 h-3" />
-            <span>Update Scope</span>
-          </button>
+          {canManageDept && (
+            <button
+              onClick={() => setIsEditModalOpen(true)}
+              className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 cursor-pointer"
+            >
+              <Edit2 className="w-3 h-3" />
+              <span>Update Scope</span>
+            </button>
+          )}
         </div>
         <p className="text-xs text-slate-200 leading-relaxed bg-slate-950/60 p-3.5 rounded-lg border border-slate-800/80">
           {dept?.description || 'No formal operational description provided yet.'}
@@ -370,16 +381,18 @@ export const MyDepartmentPage: React.FC = () => {
               Assigned Department Employees ({employees.length})
             </h2>
           </div>
-          <button
-            onClick={() => {
-              setTransferringEmployee(null);
-              setIsAssignModalOpen(true);
-            }}
-            className="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white flex items-center space-x-1 transition-colors cursor-pointer"
-          >
-            <UserPlus className="w-3.5 h-3.5" />
-            <span>Add Member</span>
-          </button>
+          {canManageDept && (
+            <button
+              onClick={() => {
+                setTransferringEmployee(null);
+                setIsAssignModalOpen(true);
+              }}
+              className="px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white flex items-center space-x-1 transition-colors cursor-pointer"
+            >
+              <UserPlus className="w-3.5 h-3.5" />
+              <span>Add Member</span>
+            </button>
+          )}
         </div>
 
         {employees.length > 0 ? (
@@ -391,7 +404,7 @@ export const MyDepartmentPage: React.FC = () => {
                   <th className="py-2.5 px-3">Position / Title</th>
                   <th className="py-2.5 px-3">Designation</th>
                   <th className="py-2.5 px-3">Assigned Date</th>
-                  <th className="py-2.5 px-3 text-right">Actions</th>
+                  {canManageDept && <th className="py-2.5 px-3 text-right">Actions</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800 text-slate-300">
@@ -418,28 +431,32 @@ export const MyDepartmentPage: React.FC = () => {
                     <td className="py-2.5 px-3 text-slate-400 font-mono text-[11px]">
                       {new Date(emp.assigned_at).toLocaleDateString()}
                     </td>
-                    <td className="py-2.5 px-3 text-right">
-                      <div className="flex items-center justify-end space-x-1">
-                        <button
-                          onClick={() => {
-                            setTransferringEmployee(emp);
-                            setIsAssignModalOpen(true);
-                          }}
-                          title="Transfer to another department"
-                          className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-indigo-300 transition-colors cursor-pointer"
-                        >
-                          <ArrowRightLeft className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleRemoveEmployee(emp.user_id, emp.full_name)}
-                          disabled={removingEmpId === emp.user_id}
-                          title="Remove from department"
-                          className="p-1.5 rounded hover:bg-rose-950/60 text-slate-400 hover:text-rose-400 transition-colors cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </td>
+                    {canManageDept && (
+                      <td className="py-2.5 px-3 text-right">
+                        <div className="flex items-center justify-end space-x-1">
+                          {managedIds.length > 1 && (
+                            <button
+                              onClick={() => {
+                                setTransferringEmployee(emp);
+                                setIsAssignModalOpen(true);
+                              }}
+                              title="Transfer to another managed department"
+                              className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                            >
+                              <ArrowRightLeft className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleRemoveEmployee(emp.user_id, emp.full_name)}
+                            disabled={removingEmpId === emp.user_id}
+                            title="Remove from department"
+                            className="p-1.5 rounded hover:bg-rose-950/60 text-slate-400 hover:text-rose-400 transition-colors cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -456,7 +473,11 @@ export const MyDepartmentPage: React.FC = () => {
       {isAssignModalOpen && dept && (
         <AssignEmployeeModal
           department={dept}
-          departments={allDepartments}
+          departments={
+            transferringEmployee
+              ? allDepartments.filter((d) => managedIds.includes(d.id))
+              : allDepartments
+          }
           users={usersList}
           transferEmployee={transferringEmployee}
           onClose={() => {

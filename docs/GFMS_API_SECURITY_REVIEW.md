@@ -2,7 +2,7 @@
 
 **Application:** Garment Factory Management System (GFMS v0.3)  
 **Phase:** 05 – Security & Authorization Review  
-**Source of Truth:** Verified against `backend/src/middleware/auth.middleware.ts`, `backend/src/config/env.ts`, `backend/src/routes/index.ts`, `backend/src/modules/*`, and `database/seeds/001..005`.
+**Source of Truth:** Verified against `backend/src/middleware/auth.middleware.ts`, `backend/src/config/env.ts`, `backend/src/routes/index.ts`, `backend/src/modules/*`, and `database/seeds/001..006`.
 
 ---
 
@@ -10,9 +10,10 @@
 
 ### 1.1 Verified Controls
 - **Password Hashing**: `bcryptjs` (`$2b$`, 10 salt rounds) across seeds and `UserService.createUser`; `password_hash` is stripped from all user list/login/me DTOs.
-- **Live DB Re-Validation on Every Request**: `authenticateJWT` does **not** trust stale JWT claims. On every HTTP call, it verifies signature/expiry (`jwt.verify`) and queries PostgreSQL for `users.is_active`, `roles`, `permissions`, `managed_department_ids`, `managed_warehouse_ids`, and `supervised_line_ids`.
+- **Live DB Re-Validation on Every Request**: `authenticateJWT` does **not** trust stale JWT claims. On every HTTP call, it verifies signature/expiry (`jwt.verify`) and queries PostgreSQL for `users.is_active`, `roles`, `permissions`, `managed_department_ids`, `planning_department_ids`, `managed_warehouse_ids`, and `supervised_line_ids`.
   - Deactivating a user (`users.is_active = FALSE`) blocks all active tokens immediately (`403 ACCOUNT_DEACTIVATED`).
   - Revoking a warehouse assignment (`DELETE /api/warehouses/:id/staff/:userId`) or changing department manager takes effect immediately on the next request.
+  - `managed_department_ids` / `primary_department_id` are granted strictly to authorized `Department Manager` users (`!Factory Manager`, `!System Administrator`, holding `departments:scoped:view` or `departments:scoped:manage`).
 
 ### 1.2 Findings & Hardening Requirements
 | Severity | Finding | Code Location | Required Remediation |
@@ -31,25 +32,32 @@
 - `Finance Viewer` holds read-only permissions (`dashboard:view`, `warehouse:view`, `warehouse:reports:valuation`) and receives `403` on all write endpoints.
 - `Warehouse Keeper` holds operational execution permissions only (`receive`, `issue`, `return`, `transfer`, `count`, `adjust:propose`, `reorder:create`) and receives `403` on `inventory:qc_inspect`, `inventory:requisition:approve`, `inventory:adjust:approve*`, `inventory:reorder:review|approve`, `warehouse:reports:valuation`, and `warehouse:settings:manage`.
 
-### 2.2 System Administrator Operational Segregation (Verified)
+### 2.2 System Administrator Operational Segregation (Verified `#57`, `#76`)
 - Seed `005_seed_warehouse_data.sql` intentionally grants `System Administrator` ONLY administrative setup & read-only valuation (`warehouse:view`, `warehouse:manage`, `warehouse:materials:manage`, `warehouse:reports:valuation`, `warehouse:settings:manage`).
-- Verified via automated test (`#57`): `System Administrator` is denied (`403`) on QC inspection (`POST /warehouse/qc/inspect`), requisition approval, adjustment/write-off approval, and reorder approval.
+- Seed `006_seed_rbac_role_clarification.sql` removed `departments:scoped:view` and `departments:scoped:manage` from `System Administrator` so `admin` never impersonates `Department Manager` (`managed_department_ids = []`) and receives `403` on `/api/planning/*`.
+- Verified via automated tests (`#57`, `#76`): `System Administrator` is denied (`403`) on QC inspection (`POST /warehouse/qc/inspect`), requisition approval, adjustment/write-off approval, reorder approval, and planning endpoints.
 - **Residual Risk (Governance)**: Because `System Administrator` holds `users:roles` (`PUT /api/users/:id/roles`), a compromised SysAdmin account could assign itself an operational role. This is mitigated by immutable `USER_ROLES_UPDATE` audit logs and must be monitored via `audit-logs`.
 
-### 2.3 Factory Manager Authority Boundaries (Verified)
-- Holds `departments:view|edit|manage_manager|manage_employees|reports`, `production:*` (except `production:settings:manage`), `warehouse:view|manage|materials:manage|reports:valuation`, `inventory:requisition:approve`, `inventory:adjust:approve`, `inventory:adjust:approve_high`, `inventory:reorder:create|approve`.
-- Intentionally excluded from `inventory:receive` and `inventory:transfer` (storekeeping execution roles) and `inventory:reorder:review` (`Purchasing Manager` stage 2) so stage separation (`DEC-10`) cannot be bypassed.
+### 2.3 Factory Manager Authority Boundaries (Verified `#75`)
+- Holds `departments:view|edit|manage_manager|manage_employees|reports`, `production:*` (except `production:settings:manage`), `planning:view` *(read-only)*, `warehouse:view|manage|materials:manage|reports:valuation`, `inventory:requisition:approve`, `inventory:adjust:approve`, `inventory:adjust:approve_high`, `inventory:reorder:create|approve`.
+- Intentionally excluded from `inventory:receive` and `inventory:transfer` (storekeeping execution roles), `inventory:reorder:review` (`Purchasing Manager` stage 2) so stage separation (`DEC-10`) cannot be bypassed, `planning:manage` (`403` on planning schedule creation), and `Department Manager` impersonation (`managed_department_ids = []`).
+
+### 2.4 Department Planner & Generic Department User Boundaries (Verified `#77`, `#79`)
+- **`Department Planner` (`planner`)**: Holds ONLY `dashboard:view`, `planning:view`, `planning:manage`, scoped strictly to `planning_department_ids` (`DEP-PLAN` #9). Blocked (`403`) on out-of-scope planning (`DEP-CUT` #11), `/api/departments*`, `/api/users`, `/api/audit-logs`, and `/api/warehouses*`. `planning:view` without `planning:manage` cannot create or mutate schedules (`403`).
+- **Generic `Department User` (`deptstaff`)**: Holds ONLY `dashboard:view` (`managed_department_ids = []`, `planning_department_ids = []`). Belonging to `DEP-CUT` in `department_employees`—or even being erroneously placed in `departments.manager_id` without `Department Manager` role/permissions—never grants department dashboard or management access (`403` across all protected department/planning/admin endpoints).
 
 ---
 
 ## 3. Multi-Dimensional Scope Enforcement
 
-### 3.1 Department Scope (`requireDepartmentScope`, `requireDepartmentTargetScope`, `DepartmentService`)
-- **Verified**:
-  - `Department Manager` may view/update operational fields (`name`, `description`) and manage employees ONLY for departments where `departments.manager_id === req.user.id`.
+### 3.1 Department & Planning Scope (`requireDepartmentScope`, `requireDepartmentTargetScope`, `requirePlanningScope`, `DepartmentService`, `PlanningService`)
+- **Verified (`#26`–`#41`, `#77`–`#79`)**:
+  - `Department Manager` may view/update operational fields (`name`, `description`) and manage employees ONLY for departments where `departments.manager_id === req.user.id` AND explicit `departments:scoped:view` (read) or `departments:scoped:manage` (mutations) permissions are held.
+  - `GET /api/departments/stats` returns metrics/distributions filtered strictly by `d.manager_id + 0 = $1` for non-global `Department Manager` users (`total = 1` for `deptuser`).
   - Restricted fields (`manager_id`, `parent_id`, `status`) on `PUT /api/departments/:id` are blocked (`403`) in both middleware and `DepartmentService`.
   - Cross-department employee transfer (`PUT /api/departments/:id/employees/transfer`) verifies authorization on **BOTH** source and target departments in `requireDepartmentScope`, `requireDepartmentTargetScope`, and `DepartmentService.transferEmployee` inside `withTransaction`.
   - `/api/departments/:id/assignable-users` returns minimal `{ id, username, full_name }` active records scoped strictly to authorized managers (`403` for unrelated departments).
+  - `requirePlanningScope` enforces `planning_department_ids` scoping on `/api/planning/departments/:id` and `POST /api/planning/schedules`, allowing global read-only view solely for `Factory Manager` (`planning:view` + `departments:view`).
 
 ### 3.2 Warehouse Scope (`requireWarehouseScope` + Service Filters)
 - **Verified**:

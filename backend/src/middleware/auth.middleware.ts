@@ -14,6 +14,7 @@ export interface AuthenticatedUser {
   primary_department_id: number | null;
   managed_warehouse_ids: number[];
   supervised_line_ids: number[];
+  planning_department_ids: number[];
 }
 
 declare global {
@@ -105,16 +106,34 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       [user.id]
     );
 
-    // Fetch departments authoritatively managed by this user
-    const managedDeptsRes = await query<{ id: number }>(
-      `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
-      [user.id]
-    );
-    const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
-    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+    const roles = rolesRes.rows.map(r => r.role_name);
+    const permissions = permRes.rows.map(p => p.permission_key);
 
-    // Fetch warehouses authoritatively assigned to this user (active warehouse_staff or manager_id)
-    const [whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+    // Derive department-manager scope strictly for authorized Department Managers
+    // (Factory Managers, System Administrators, Department Planners, and generic Department Users
+    // must never receive Department Manager workspace ownership merely via manager_id or membership).
+    const isAuthorizedDeptManager =
+      roles.includes('Department Manager') &&
+      !roles.includes('Factory Manager') &&
+      !roles.includes('System Administrator') &&
+      (permissions.includes('departments:scoped:view') || permissions.includes('departments:scoped:manage'));
+
+    const hasPlanningPermission =
+      permissions.includes('planning:view') || permissions.includes('planning:manage');
+
+    const [managedDeptsRes, planningEmpDeptsRes, whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+      isAuthorizedDeptManager
+        ? query<{ id: number }>(
+            `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
+            [user.id]
+          )
+        : Promise.resolve({ rows: [] as { id: number }[] }),
+      hasPlanningPermission
+        ? query<{ department_id: number }>(
+            `SELECT department_id FROM department_employees WHERE user_id = $1 ORDER BY department_id ASC`,
+            [user.id]
+          )
+        : Promise.resolve({ rows: [] as { department_id: number }[] }),
       query<{ warehouse_id: number }>(
         `SELECT warehouse_id FROM warehouse_staff
          WHERE user_id = $1 AND status = 'active'
@@ -132,6 +151,18 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       ),
     ]);
 
+    const managed_department_ids = isAuthorizedDeptManager ? managedDeptsRes.rows.map(r => r.id) : [];
+    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+
+    const planningDeptSet = new Set<number>();
+    if (hasPlanningPermission) {
+      for (const r of planningEmpDeptsRes.rows) planningDeptSet.add(r.department_id);
+      if (isAuthorizedDeptManager) {
+        for (const r of managedDeptsRes.rows) planningDeptSet.add(r.id);
+      }
+    }
+    const planning_department_ids = Array.from(planningDeptSet).sort((a, b) => a - b);
+
     const warehouseIdSet = new Set<number>();
     for (const r of whStaffRes.rows) warehouseIdSet.add(r.warehouse_id);
     for (const r of whMgrRes.rows) warehouseIdSet.add(r.id);
@@ -143,12 +174,13 @@ export async function authenticateJWT(req: Request, res: Response, next: NextFun
       username: user.username,
       full_name: user.full_name,
       is_active: user.is_active,
-      roles: rolesRes.rows.map(r => r.role_name),
-      permissions: permRes.rows.map(p => p.permission_key),
+      roles,
+      permissions,
       managed_department_ids,
       primary_department_id,
       managed_warehouse_ids,
       supervised_line_ids,
+      planning_department_ids,
     };
 
     next();
@@ -295,13 +327,14 @@ export function requireDepartmentScope(action: 'view' | 'edit' | 'manage_employe
       return next();
     }
 
-    // Check if user is a Department Manager
-    const isDeptManager =
-      req.user.roles.includes('Department Manager') ||
-      req.user.permissions.includes('departments:scoped:manage') ||
-      req.user.permissions.includes('departments:scoped:view');
+    // Require explicit scoped permission matching the requested action (never bypass via role name alone)
+    const hasScopedPermission =
+      action === 'view'
+        ? req.user.permissions.includes('departments:scoped:view') ||
+          req.user.permissions.includes('departments:scoped:manage')
+        : req.user.permissions.includes('departments:scoped:manage');
 
-    if (!isDeptManager) {
+    if (!hasScopedPermission) {
       res.status(403).json({
         success: false,
         error: {
@@ -381,11 +414,11 @@ export function requireDepartmentListAccess(req: Request, res: Response, next: N
   }
 
   const hasGlobal = req.user.permissions.includes('departments:view');
-  const isDeptManager =
-    req.user.roles.includes('Department Manager') ||
-    req.user.permissions.includes('departments:scoped:view');
+  const hasScoped =
+    req.user.permissions.includes('departments:scoped:view') ||
+    req.user.permissions.includes('departments:scoped:manage');
 
-  if (hasGlobal || isDeptManager) {
+  if (hasGlobal || hasScoped) {
     return next();
   }
 
@@ -398,7 +431,7 @@ export function requireDepartmentListAccess(req: Request, res: Response, next: N
 /**
  * Middleware enforcing target department authorization for cross-department employee transfers.
  * Global managers (departments:manage_employees) are allowed globally.
- * Department Managers must authoritatively manage the target department as well as the source department.
+ * Department Managers must hold departments:scoped:manage and authoritatively manage BOTH source and target departments.
  */
 export async function requireDepartmentTargetScope(
   req: Request,
@@ -417,11 +450,9 @@ export async function requireDepartmentTargetScope(
     return next();
   }
 
-  const isDeptManager =
-    req.user.roles.includes('Department Manager') ||
-    req.user.permissions.includes('departments:scoped:manage');
+  const hasScopedManage = req.user.permissions.includes('departments:scoped:manage');
 
-  if (!isDeptManager) {
+  if (!hasScopedManage) {
     res.status(403).json({
       success: false,
       error: {
@@ -472,18 +503,49 @@ export async function requireDepartmentTargetScope(
   }
 }
 
-export const GLOBAL_WAREHOUSE_ROLES = new Set([
-  'System Administrator',
-  'Factory Manager',
-  'Production Manager',
-  'Purchasing Manager',
-  'Finance Viewer',
-  'QC Manager',
-  'QC Inspector',
-]);
+export function canCreateOrManageAllWarehouses(user: AuthenticatedUser): boolean {
+  return (
+    user.permissions.includes('warehouse:create') ||
+    user.permissions.includes('warehouse:settings:manage') ||
+    user.permissions.includes('inventory:adjust:approve_high')
+  );
+}
 
+/**
+ * Determines whether the authenticated user has cross-warehouse operational visibility.
+ * Replaces legacy role-name bypasses with explicit permission + warehouse_staff assignment scoping:
+ * - Global oversight capabilities (warehouse settings, high-value approvals, QC override, purchasing review) grant global access.
+ * - Warehouse Managers, Warehouse Keepers, and Department Managers never receive global bypass.
+ * - Specialists assigned in warehouse_staff (managed_warehouse_ids.length > 0) are strictly restricted to those warehouses.
+ * - Unassigned specialists with cross-warehouse read/QC/requisition approval capabilities retain enterprise pool fallback.
+ */
 export function hasGlobalWarehouseAccess(user: AuthenticatedUser): boolean {
-  return user.roles.some((r) => GLOBAL_WAREHOUSE_ROLES.has(r));
+  if (
+    user.permissions.includes('warehouse:settings:manage') ||
+    user.permissions.includes('inventory:adjust:approve_high') ||
+    user.permissions.includes('inventory:qc_override') ||
+    user.permissions.includes('inventory:reorder:review')
+  ) {
+    return true;
+  }
+
+  if (
+    user.roles.includes('Warehouse Manager') ||
+    user.roles.includes('Warehouse Keeper') ||
+    user.roles.includes('Department Manager')
+  ) {
+    return false;
+  }
+
+  if (user.managed_warehouse_ids.length > 0) {
+    return false;
+  }
+
+  return (
+    user.permissions.includes('warehouse:reports:valuation') ||
+    user.permissions.includes('inventory:qc_inspect') ||
+    user.permissions.includes('inventory:requisition:approve')
+  );
 }
 
 /**
@@ -700,5 +762,61 @@ export function requireProductionLineScope(
   };
 }
 
+/**
+ * Middleware enforcing department & resource scope on Planning endpoints.
+ * - Factory Manager with planning:view + departments:view gets read-only factory visibility when readOnlyGlobalAllowed is true.
+ * - Scoped Department Planners are strictly limited to req.user.planning_department_ids.
+ */
+export function requirePlanningScope(
+  options: {
+    paramKey?: string;
+    bodyKey?: string;
+    readOnlyGlobalAllowed?: boolean;
+  } = {}
+) {
+  const paramKey = options.paramKey || 'id';
+  const bodyKey = options.bodyKey || 'department_id';
 
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Authentication required' },
+      });
+      return;
+    }
 
+    const isGlobalPlanningViewer =
+      Boolean(options.readOnlyGlobalAllowed) &&
+      req.user.permissions.includes('planning:view') &&
+      req.user.permissions.includes('departments:view') &&
+      req.user.roles.includes('Factory Manager');
+
+    if (isGlobalPlanningViewer) {
+      return next();
+    }
+
+    const rawDeptId = req.params?.[paramKey] ?? req.body?.[bodyKey];
+    const deptId = parseInt(String(rawDeptId), 10);
+    if (isNaN(deptId) || deptId <= 0) {
+      res.status(400).json({
+        success: false,
+        error: { code: 'BAD_REQUEST', message: 'Valid department_id is required' },
+      });
+      return;
+    }
+
+    if (!req.user.planning_department_ids.includes(deptId)) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: 'FORBIDDEN',
+          message: `Access denied. Department #${deptId} is outside your assigned planning scope.`,
+        },
+      });
+      return;
+    }
+
+    next();
+  };
+}

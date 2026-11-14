@@ -21,6 +21,7 @@ GFMS runs a single Express 4 REST API mounted under `/api` (`backend/src/app.ts`
 | **Diagnostics** | `tests/runner.ts` | `/api/tests/run` | `authenticateJWT` + `requireRole('System Administrator')` |
 | **Production** | `modules/production/*` | `/api/production/*` | `authenticateJWT` + `requirePermission('production:*')` |
 | **Departments** | `modules/departments/*` | `/api/departments/*` | `authenticateJWT` + `requireDepartmentListAccess` / `requireDepartmentScope` / `requireDepartmentTargetScope` / `requirePermission` |
+| **Department Planning (`006`)** | `modules/planning/*` | `/api/planning/*` | `authenticateJWT` + `requirePermission` / `requireAnyPermission` + `requirePlanningScope` |
 | **WMS (Phase 04)** | `modules/warehouse/*` | `/api/warehouses/*`, `/api/warehouse/*`, `/api/inventory/*` | `authenticateJWT` (`wmsRouter.use(authenticateJWT)`) + `requirePermission` / `requireAnyPermission` + `requireWarehouseScope` / `requireProductionLineScope` |
 
 ---
@@ -66,8 +67,10 @@ GFMS runs a single Express 4 REST API mounted under `/api` (`backend/src/app.ts`
 
 ### 2.6 Authentication, Permission & Scope Enforcement
 - **Verified**:
-  - `authenticateJWT` validates signature & expiry and re-queries PostgreSQL live (`is_active`, roles, permissions, `managed_department_ids`, `managed_warehouse_ids`, `supervised_line_ids`). Account deactivation and warehouse staff revocation apply immediately.
-  - Multi-layered scopes (`requireDepartmentScope`, `requireDepartmentTargetScope`, `requireWarehouseScope`, `requireProductionLineScope`) plus service-layer defense-in-depth checks (`WarehouseInboundService`, `WarehouseOutboundService`, `WarehouseControlService`, `WarehouseMasterService`, `DepartmentService`).
+  - `authenticateJWT` validates signature & expiry and re-queries PostgreSQL live (`is_active`, roles, permissions, `managed_department_ids`, `planning_department_ids`, `managed_warehouse_ids`, `supervised_line_ids`). Account deactivation and warehouse staff revocation apply immediately.
+  - `managed_department_ids` / `primary_department_id` are derived strictly for authorized `Department Manager` accounts (never for `Factory Manager`, `System Administrator`, `Department Planner`, or generic `Department User`).
+  - `DepartmentService.getDepartmentStats` enforces manager-scoped filtering (`d.manager_id + 0 = $1`) for non-global callers.
+  - Multi-layered scopes (`requireDepartmentScope`, `requireDepartmentTargetScope`, `requirePlanningScope`, `requireWarehouseScope`, `requireProductionLineScope`) plus service-layer defense-in-depth checks (`WarehouseInboundService`, `WarehouseOutboundService`, `WarehouseControlService`, `WarehouseMasterService`, `DepartmentService`, `PlanningService`).
 - **Correction Needed**:
   - `WarehouseMasterService.markNotificationRead(notificationId, actor)` (`warehouse-master.service.ts:1144`) updates `warehouse_notifications` by `id` without validating that the notification belongs to `actor.id`, `actor.roles`, or `actor.managed_warehouse_ids`.
   - `WarehouseController.createWarehouse` / `toggleWarehouseStatus` checks `hasGlobalWarehouseAccess(req.user!)`, which checks membership in `GLOBAL_WAREHOUSE_ROLES` (7 roles including `Finance Viewer`, `Purchasing Manager`, etc.); while route `requirePermission('warehouse:manage')` limits this to `System Administrator` and `Factory Manager` in seeded roles, granting `warehouse:manage` to a custom role containing `QC Inspector` would allow warehouse creation unless explicitly restricted to `System Administrator` / `Factory Manager`.
@@ -82,19 +85,14 @@ GFMS runs a single Express 4 REST API mounted under `/api` (`backend/src/app.ts`
   - `DepartmentService.removeEmployee` and `deleteDepartment` execute `DELETE` then `AuditService.log` outside `withTransaction`.
   - `WarehouseMasterService.markNotificationRead` logs `WMS_NOTIFICATION_READ` after updating `warehouse_notifications` outside a transaction.
 
-### 2.8 Documentation Discrepancies Fixed/Identified
-Verified discrepancies in pre-Phase-05 `docs/API_SPECIFICATION.md`:
-1. Duplicate `## 7.` section numbers (Department Management and WMS both numbered `## 7.`).
-2. `GET /api/health` example listed `tables_count: 6` (stale v0.1 value; live schema with `005` has `40` tables).
-3. `POST /api/auth/login` and `GET /api/auth/me` examples omitted `managed_department_ids`, `primary_department_id`, `managed_warehouse_ids`, and `supervised_line_ids`.
-4. `GET /api/tests/run` documented `- Auth: Protected`, omitting that `routes/index.ts:373` restricts it to `requireRole('System Administrator')`.
-5. Missing documented endpoints present in `routes/index.ts`:
-   - `GET /api/departments/:id/lines`
-   - `GET /api/departments/:id/assignable-users`
-   - `PUT /api/production/stages/:id` & `PUT /api/production/stages/:id/status`
-   - `GET /api/production/workflows/:id`, `PUT /api/production/workflows/:id`, `PUT /api/production/workflows/:id/status`
+### 2.8 Documentation Discrepancies Identified
+Verified discrepancies remaining in legacy `docs/API_SPECIFICATION.md`:
+1. `GET /api/health` example lists `tables_count: 6` (stale v0.1 value; live schema with `005` + `006` has `41` tables).
+2. `POST /api/auth/login` and `GET /api/auth/me` examples omit `managed_department_ids`, `primary_department_id`, `planning_department_ids`, `managed_warehouse_ids`, and `supervised_line_ids`.
+3. `GET /api/tests/run` notes `- Auth: Protected`, omitting that `routes/index.ts` restricts it to `requireRole('System Administrator')`.
+4. Newer routes implemented in `routes/index.ts` and `planning.routes.ts` (`/api/departments/:id/lines`, `/api/departments/:id/assignable-users`, `/api/production/stages/:id*`, `/api/production/workflows/:id*`, `/api/planning/*`) are absent from `docs/API_SPECIFICATION.md`.
 
-*(Updated in `docs/API_SPECIFICATION.md` during Phase 05.)*
+*(Phase 05 consolidated architecture, standards, integration contracts, and security review in `docs/GFMS_*` documents without altering legacy API compatibility.)*
 
 ---
 

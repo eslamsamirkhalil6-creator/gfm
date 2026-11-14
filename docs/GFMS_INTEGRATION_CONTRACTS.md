@@ -61,6 +61,8 @@ Existing Foundation (Users/RBAC, Departments, Production Setup, Audit, WMS Phase
 
 ## 2. Production Planning & Control (`DEP-PLAN`)
 
+> **Current Implementation Baseline (`006_rbac_role_clarification.sql`)**: Baseline scoped departmental schedules (`department_planning_schedules`, `GET /api/planning/dashboard`, `GET /api/planning/departments/:id`, `POST /api/planning/schedules`, `PUT /api/planning/schedules/:id/status`) and role separation (`Department Planner` with `planning:view`, `planning:manage`) are active. Full `/api/planning/plans`, targets, and MRP shortage workflows below remain unimplemented future integration contracts.
+
 ### 2.1 Expected API Resources
 - `GET/POST /api/planning/plans`, `GET/PUT /api/planning/plans/:id`, `POST /api/planning/plans/:id/approve`
 - `GET/POST /api/planning/schedules` *(assigns plans to `production_lines` and `production_workflows`)*
@@ -72,10 +74,10 @@ Existing Foundation (Users/RBAC, Departments, Production Setup, Audit, WMS Phase
 - **Boundary with Production & WMS**: Planning reads `production_lines` / `production_workflows` (`ProductionService`) and reads `qty_available` / reserves materials via `WarehouseOutboundService` — Planning MUST NEVER mutate `inventory_balances` directly.
 
 ### 2.3 Required Permissions
-- `planning:view`, `planning:manage`, `planning:schedule`, `planning:approve`, `planning:mrp:run`.
+- `planning:view`, `planning:manage` *(active in `006`)*, plus future `planning:schedule`, `planning:approve`, `planning:mrp:run`.
 
 ### 2.4 Data Ownership
-- **Owns**: Production plans, style/order targets, line schedules, capacity utilization snapshots, and MRP shortage calculations.
+- **Owns**: Production plans, style/order targets, line schedules (`department_planning_schedules`), capacity utilization snapshots, and MRP shortage calculations.
 - **Does NOT Own**: Physical `production_halls`/`lines`/`workflows` master setup (`ProductionService`), physical stock balances or WAC (`InventoryEngineService`).
 
 ### 2.5 Relationships with Existing Modules

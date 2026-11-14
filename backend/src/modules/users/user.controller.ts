@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { UserService } from './user.service.ts';
+import { parsePositiveInt } from '../warehouse/warehouse.errors.ts';
 
 export class UserController {
   static async listUsers(_req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -37,7 +38,7 @@ export class UserController {
 
   static async updateUserStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const userId = parseInt(req.params.id, 10);
+      const userId = parsePositiveInt(req.params.id, 'user_id');
       const { is_active } = req.body;
       const ipAddress = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
 
@@ -65,7 +66,7 @@ export class UserController {
 
   static async updateUserRoles(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const userId = parseInt(req.params.id, 10);
+      const userId = parsePositiveInt(req.params.id, 'user_id');
       const { roleIds } = req.body;
       const ipAddress = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
 

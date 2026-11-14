@@ -1,5 +1,11 @@
-import { query, QueryFn, QueryResult, withTransaction } from '../../config/database.ts';
+import { query, QueryFn, QueryResult, sqlEqInt, withTransaction } from '../../config/database.ts';
 import { AuditService } from '../audit/audit.service.ts';
+import {
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+} from '../warehouse/warehouse.errors.ts';
 import {
   Department,
   DepartmentWithDetails,
@@ -18,7 +24,11 @@ export class DepartmentService {
    * Helper to check circular parent-child dependency
    * Returns true if candidateParentId is a descendant of departmentId (which would create a cycle)
    */
-  private static async isDescendant(candidateParentId: number, departmentId: number): Promise<boolean> {
+  private static async isDescendant(
+    candidateParentId: number,
+    departmentId: number,
+    txQuery: QueryFn = query
+  ): Promise<boolean> {
     if (candidateParentId === departmentId) return true;
 
     let currentParentId: number | null = candidateParentId;
@@ -33,7 +43,7 @@ export class DepartmentService {
       }
       visited.add(currentParentId);
 
-      const res: QueryResult<{ parent_id: number | null }> = await query<{ parent_id: number | null }>(
+      const res: QueryResult<{ parent_id: number | null }> = await txQuery<{ parent_id: number | null }>(
         'SELECT parent_id FROM departments WHERE id = $1',
         [currentParentId]
       );
@@ -80,10 +90,8 @@ export class DepartmentService {
     const params: any[] = [];
     let paramIndex = 1;
 
-    // Scoped filtering: if not a global viewer, only return departments managed by this user.
-    // Using `+ 0` avoids pg-mem's `NotSupported: lookups on joins` on indexed FK columns while remaining standard PostgreSQL SQL.
     if (!isGlobalViewer && actorUserId !== undefined) {
-      sql += ` AND d.manager_id + 0 = $${paramIndex++}`;
+      sql += ` AND ${sqlEqInt('d.manager_id', `$${paramIndex++}`)}`;
       params.push(actorUserId);
     }
 
@@ -183,12 +191,11 @@ export class DepartmentService {
     const list = await this.listDepartments();
     const dept = list.find(d => d.id === id);
     if (!dept) {
-      throw new Error(`Department with ID ${id} not found.`);
+      throw notFound(`Department with ID ${id} not found.`);
     }
 
     const subDepartments = list.filter(d => d.parent_id === id);
 
-    // Fetch assigned employees
     const empRes = await query(
       `
       SELECT 
@@ -210,7 +217,6 @@ export class DepartmentService {
       [id]
     );
 
-    // Fetch manager assignment history
     const historyRes = await query(
       `
       SELECT 
@@ -233,7 +239,6 @@ export class DepartmentService {
       [id]
     );
 
-    // Fetch department-linked production lines
     const linesRes = await query<{
       id: number;
       line_number: string;
@@ -282,6 +287,11 @@ export class DepartmentService {
    * Get production lines linked to a department
    */
   static async getDepartmentLines(deptId: number) {
+    const deptCheck = await query('SELECT id FROM departments WHERE id = $1', [deptId]);
+    if (deptCheck.rows.length === 0) {
+      throw notFound(`Department with ID ${deptId} not found.`);
+    }
+
     const res = await query<{
       id: number;
       line_number: string;
@@ -332,9 +342,7 @@ export class DepartmentService {
   > {
     const deptCheck = await query('SELECT id FROM departments WHERE id = $1', [deptId]);
     if (deptCheck.rows.length === 0) {
-      const err: any = new Error(`Department with ID ${deptId} not found.`);
-      err.statusCode = 404;
-      throw err;
+      throw notFound(`Department with ID ${deptId} not found.`);
     }
 
     const res = await query<{
@@ -353,9 +361,82 @@ export class DepartmentService {
   }
 
   /**
-   * Get department dashboard statistics and distribution metrics
+   * Get department dashboard statistics and distribution metrics.
    */
-  static async getDepartmentStats(): Promise<DepartmentStats> {
+  static async getDepartmentStats(
+    actorUserId?: number,
+    isGlobalViewer: boolean = true
+  ): Promise<DepartmentStats> {
+    if (!isGlobalViewer) {
+      if (actorUserId === undefined) {
+        return {
+          total: 0,
+          active: 0,
+          inactive: 0,
+          with_manager: 0,
+          without_manager: 0,
+          total_employee_assignments: 0,
+          distribution: [],
+        };
+      }
+
+      const [countsRes, totalAssignmentsRes, distributionRes] = await Promise.all([
+        query(
+          `
+          SELECT 
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'active') as active,
+            COUNT(*) FILTER (WHERE status = 'inactive') as inactive,
+            COUNT(*) FILTER (WHERE manager_id IS NOT NULL) as with_manager,
+            COUNT(*) FILTER (WHERE manager_id IS NULL) as without_manager
+          FROM departments
+          WHERE ${sqlEqInt('manager_id', '$1')}
+          `,
+          [actorUserId]
+        ),
+        query(
+          `
+          SELECT COUNT(*) as total_assignments
+          FROM department_employees de
+          JOIN departments d ON de.department_id = d.id
+          WHERE ${sqlEqInt('d.manager_id', '$1')}
+          `,
+          [actorUserId]
+        ),
+        query(
+          `
+          SELECT 
+            d.id as department_id,
+            d.dept_code,
+            d.name,
+            COUNT(de.id) as employee_count
+          FROM departments d
+          LEFT JOIN department_employees de ON d.id = de.department_id
+          WHERE d.status = 'active' AND ${sqlEqInt('d.manager_id', '$1')}
+          GROUP BY d.id, d.dept_code, d.name
+          ORDER BY employee_count DESC, d.name ASC
+          `,
+          [actorUserId]
+        ),
+      ]);
+
+      const c = countsRes.rows[0];
+      return {
+        total: parseInt(c.total || '0', 10),
+        active: parseInt(c.active || '0', 10),
+        inactive: parseInt(c.inactive || '0', 10),
+        with_manager: parseInt(c.with_manager || '0', 10),
+        without_manager: parseInt(c.without_manager || '0', 10),
+        total_employee_assignments: parseInt(totalAssignmentsRes.rows[0]?.total_assignments || '0', 10),
+        distribution: distributionRes.rows.map(r => ({
+          department_id: r.department_id,
+          dept_code: r.dept_code,
+          name: r.name,
+          employee_count: parseInt(r.employee_count || '0', 10),
+        })),
+      };
+    }
+
     const [countsRes, totalAssignmentsRes, distributionRes] = await Promise.all([
       query(`
         SELECT 
@@ -399,72 +480,74 @@ export class DepartmentService {
   }
 
   /**
-   * Create a new department with unique code and hierarchy validation
+   * Create a new department with unique code and hierarchy validation inside a transaction
    */
   static async createDepartment(
     dto: CreateDepartmentDTO,
     actorId: number,
     ipAddress?: string
   ): Promise<DepartmentWithDetails> {
-    const code = dto.dept_code.trim().toUpperCase();
-    const name = dto.name.trim();
+    const code = String(dto.dept_code || '').trim().toUpperCase();
+    const name = String(dto.name || '').trim();
 
     if (!code || !name) {
-      throw new Error('Department code and name are required.');
+      throw badRequest('Department code and name are required.');
     }
 
-    // Check code uniqueness
-    const codeCheck = await query('SELECT id FROM departments WHERE UPPER(dept_code) = $1', [code]);
-    if (codeCheck.rows.length > 0) {
-      throw new Error(`Department code "${code}" already exists. Department codes must be unique.`);
-    }
-
-    // Validate parent if provided
-    if (dto.parent_id) {
-      const parentCheck = await query('SELECT id, status FROM departments WHERE id = $1', [dto.parent_id]);
-      if (parentCheck.rows.length === 0) {
-        throw new Error(`Parent department with ID ${dto.parent_id} does not exist.`);
+    const newId = await withTransaction(async (txQuery) => {
+      const codeCheck = await txQuery('SELECT id FROM departments WHERE UPPER(dept_code) = $1', [code]);
+      if (codeCheck.rows.length > 0) {
+        throw conflict(`Department code "${code}" already exists. Department codes must be unique.`, 'DUPLICATE_DEPT_CODE');
       }
-    }
 
-    // Validate manager if provided
-    if (dto.manager_id) {
-      const userCheck = await query('SELECT id, full_name FROM users WHERE id = $1', [dto.manager_id]);
-      if (userCheck.rows.length === 0) {
-        throw new Error(`User with ID ${dto.manager_id} specified as manager does not exist.`);
+      if (dto.parent_id) {
+        const parentCheck = await txQuery('SELECT id, status FROM departments WHERE id = $1', [dto.parent_id]);
+        if (parentCheck.rows.length === 0) {
+          throw notFound(`Parent department with ID ${dto.parent_id} does not exist.`);
+        }
       }
-    }
 
-    const insertRes = await query(
-      `
-      INSERT INTO departments (dept_code, name, description, parent_id, manager_id, status)
-      VALUES ($1, $2, $3, $4, $5, 'active')
-      RETURNING id
-      `,
-      [code, name, dto.description?.trim() || null, dto.parent_id || null, dto.manager_id || null]
-    );
+      if (dto.manager_id) {
+        const userCheck = await txQuery('SELECT id, full_name FROM users WHERE id = $1', [dto.manager_id]);
+        if (userCheck.rows.length === 0) {
+          throw notFound(`User with ID ${dto.manager_id} specified as manager does not exist.`);
+        }
+      }
 
-    const newId = insertRes.rows[0].id;
-
-    // Record manager history if manager assigned on creation
-    if (dto.manager_id) {
-      await query(
+      const insertRes = await txQuery(
         `
-        INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
-        VALUES ($1, $2, $3, 'Initial manager appointment on department creation')
+        INSERT INTO departments (dept_code, name, description, parent_id, manager_id, status)
+        VALUES ($1, $2, $3, $4, $5, 'active')
+        RETURNING id
         `,
-        [newId, dto.manager_id, actorId]
+        [code, name, dto.description?.trim() || null, dto.parent_id || null, dto.manager_id || null]
       );
-    }
 
-    // Audit Log
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_CREATE',
-      entityType: 'DEPARTMENT',
-      entityId: String(newId),
-      details: `Created department "${name}" [${code}]${dto.parent_id ? ` under parent #${dto.parent_id}` : ''}`,
-      ipAddress,
+      const createdId = insertRes.rows[0].id;
+
+      if (dto.manager_id) {
+        await txQuery(
+          `
+          INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
+          VALUES ($1, $2, $3, 'Initial manager appointment on department creation')
+          `,
+          [createdId, dto.manager_id, actorId]
+        );
+      }
+
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_CREATE',
+          entityType: 'DEPARTMENT',
+          entityId: String(createdId),
+          details: `Created department "${name}" [${code}]${dto.parent_id ? ` under parent #${dto.parent_id}` : ''}`,
+          ipAddress,
+        },
+        txQuery
+      );
+
+      return createdId;
     });
 
     const full = await this.getDepartmentById(newId);
@@ -472,7 +555,7 @@ export class DepartmentService {
   }
 
   /**
-   * Update department information, parent hierarchy, or manager
+   * Update department information, parent hierarchy, or manager inside an atomic transaction
    */
   static async updateDepartment(
     id: number,
@@ -486,105 +569,105 @@ export class DepartmentService {
       ipAddress = undefined;
     }
 
-    const existing = await query('SELECT * FROM departments WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      throw new Error(`Department with ID ${id} not found.`);
-    }
-    const currentDept = existing.rows[0];
+    await withTransaction(async (txQuery) => {
+      const existing = await txQuery('SELECT * FROM departments WHERE id = $1 FOR UPDATE', [id]);
+      if (existing.rows.length === 0) {
+        throw notFound(`Department with ID ${id} not found.`);
+      }
+      const currentDept = existing.rows[0];
 
-    // Hierarchy validation: circular check and permission check
-    if (dto.parent_id !== undefined && dto.parent_id !== currentDept.parent_id) {
-      if (
-        actorPermissions.length > 0 &&
-        !actorPermissions.includes('departments:hierarchy') &&
-        !actorPermissions.includes('departments:create')
-      ) {
-        const err: any = new Error('Altering department hierarchy requires departments:hierarchy permission.');
-        err.statusCode = 403;
-        throw err;
-      }
-      if (dto.parent_id === id) {
-        throw new Error('A department cannot be its own parent.');
-      }
-      if (dto.parent_id !== null) {
-        const parentCheck = await query('SELECT id FROM departments WHERE id = $1', [dto.parent_id]);
-        if (parentCheck.rows.length === 0) {
-          throw new Error(`Parent department with ID ${dto.parent_id} does not exist.`);
+      if (dto.parent_id !== undefined && dto.parent_id !== currentDept.parent_id) {
+        if (
+          actorPermissions.length > 0 &&
+          !actorPermissions.includes('departments:hierarchy') &&
+          !actorPermissions.includes('departments:create')
+        ) {
+          throw forbidden('Altering department hierarchy requires departments:hierarchy permission.');
         }
+        if (dto.parent_id === id) {
+          throw badRequest('A department cannot be its own parent.', 'CIRCULAR_HIERARCHY');
+        }
+        if (dto.parent_id !== null) {
+          const parentCheck = await txQuery('SELECT id FROM departments WHERE id = $1', [dto.parent_id]);
+          if (parentCheck.rows.length === 0) {
+            throw notFound(`Parent department with ID ${dto.parent_id} does not exist.`);
+          }
 
-        const isCycle = await this.isDescendant(dto.parent_id, id);
-        if (isCycle) {
-          throw new Error(
-            'Invalid hierarchy: Circular parent-child relationship detected. A department cannot be placed under one of its own sub-departments.'
+          const isCycle = await this.isDescendant(dto.parent_id, id, txQuery);
+          if (isCycle) {
+            throw badRequest(
+              'Invalid hierarchy: Circular parent-child relationship detected. A department cannot be placed under one of its own sub-departments.',
+              'CIRCULAR_HIERARCHY'
+            );
+          }
+        }
+      }
+
+      if (dto.manager_id !== undefined && dto.manager_id !== currentDept.manager_id) {
+        if (
+          actorPermissions.length > 0 &&
+          !actorPermissions.includes('departments:manage_manager') &&
+          !actorPermissions.includes('departments:create')
+        ) {
+          throw forbidden('Changing department manager requires departments:manage_manager permission.');
+        }
+        if (dto.manager_id !== null) {
+          const userCheck = await txQuery('SELECT id FROM users WHERE id = $1', [dto.manager_id]);
+          if (userCheck.rows.length === 0) {
+            throw notFound(`User with ID ${dto.manager_id} specified as manager does not exist.`);
+          }
+        }
+      }
+
+      const updatedName = dto.name !== undefined ? dto.name.trim() : currentDept.name;
+      if (!updatedName) {
+        throw badRequest('Department name cannot be empty.');
+      }
+      const updatedDesc = dto.description !== undefined ? (dto.description?.trim() || null) : currentDept.description;
+      const updatedParent = dto.parent_id !== undefined ? dto.parent_id : currentDept.parent_id;
+      const updatedManager = dto.manager_id !== undefined ? dto.manager_id : currentDept.manager_id;
+
+      if (dto.manager_id !== undefined && dto.manager_id !== currentDept.manager_id) {
+        await txQuery(
+          `
+          UPDATE department_manager_history 
+          SET relinquished_at = CURRENT_TIMESTAMP
+          WHERE department_id = $1 AND relinquished_at IS NULL
+          `,
+          [id]
+        );
+
+        if (dto.manager_id !== null) {
+          await txQuery(
+            `
+            INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
+            VALUES ($1, $2, $3, 'Manager updated via department edit')
+            `,
+            [id, dto.manager_id, actorId]
           );
         }
       }
-    }
 
-    // Validate manager if provided
-    if (dto.manager_id !== undefined && dto.manager_id !== currentDept.manager_id) {
-      if (
-        actorPermissions.length > 0 &&
-        !actorPermissions.includes('departments:manage_manager') &&
-        !actorPermissions.includes('departments:create')
-      ) {
-        const err: any = new Error('Changing department manager requires departments:manage_manager permission.');
-        err.statusCode = 403;
-        throw err;
-      }
-      if (dto.manager_id !== null) {
-        const userCheck = await query('SELECT id FROM users WHERE id = $1', [dto.manager_id]);
-        if (userCheck.rows.length === 0) {
-          throw new Error(`User with ID ${dto.manager_id} specified as manager does not exist.`);
-        }
-      }
-    }
-
-    const updatedName = dto.name !== undefined ? dto.name.trim() : currentDept.name;
-    const updatedDesc = dto.description !== undefined ? (dto.description?.trim() || null) : currentDept.description;
-    const updatedParent = dto.parent_id !== undefined ? dto.parent_id : currentDept.parent_id;
-    const updatedManager = dto.manager_id !== undefined ? dto.manager_id : currentDept.manager_id;
-
-    // Check if manager changed to record history
-    if (dto.manager_id !== undefined && dto.manager_id !== currentDept.manager_id) {
-      // Close previous active manager tenure
-      await query(
+      await txQuery(
         `
-        UPDATE department_manager_history 
-        SET relinquished_at = CURRENT_TIMESTAMP
-        WHERE department_id = $1 AND relinquished_at IS NULL
+        UPDATE departments 
+        SET name = $1, description = $2, parent_id = $3, manager_id = $4, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $5
         `,
-        [id]
+        [updatedName, updatedDesc, updatedParent, updatedManager, id]
       );
 
-      if (dto.manager_id !== null) {
-        await query(
-          `
-          INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
-          VALUES ($1, $2, $3, 'Manager updated via department edit')
-          `,
-          [id, dto.manager_id, actorId]
-        );
-      }
-    }
-
-    await query(
-      `
-      UPDATE departments 
-      SET name = $1, description = $2, parent_id = $3, manager_id = $4, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $5
-      `,
-      [updatedName, updatedDesc, updatedParent, updatedManager, id]
-    );
-
-    // Audit log
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_UPDATE',
-      entityType: 'DEPARTMENT',
-      entityId: String(id),
-      details: `Updated department "${updatedName}". Parent: ${currentDept.parent_id} -> ${updatedParent}, Manager: ${currentDept.manager_id} -> ${updatedManager}`,
-      ipAddress,
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_UPDATE',
+          entityType: 'DEPARTMENT',
+          entityId: String(id),
+          details: `Updated department "${updatedName}". Parent: ${currentDept.parent_id} -> ${updatedParent}, Manager: ${currentDept.manager_id} -> ${updatedManager}`,
+          ipAddress,
+        },
+        txQuery
+      );
     });
 
     const full = await this.getDepartmentById(id);
@@ -592,36 +675,41 @@ export class DepartmentService {
   }
 
   /**
-   * Toggle department active / inactive status
+   * Toggle department active / inactive status inside a transaction
    */
   static async toggleDepartmentStatus(
     id: number,
     actorId: number,
     ipAddress?: string
   ): Promise<DepartmentWithDetails> {
-    const existing = await query('SELECT * FROM departments WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      throw new Error(`Department with ID ${id} not found.`);
-    }
-    const dept = existing.rows[0];
-    const newStatus = dept.status === 'active' ? 'inactive' : 'active';
+    await withTransaction(async (txQuery) => {
+      const existing = await txQuery('SELECT * FROM departments WHERE id = $1 FOR UPDATE', [id]);
+      if (existing.rows.length === 0) {
+        throw notFound(`Department with ID ${id} not found.`);
+      }
+      const dept = existing.rows[0];
+      const newStatus = dept.status === 'active' ? 'inactive' : 'active';
 
-    await query(
-      `
-      UPDATE departments 
-      SET status = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2
-      `,
-      [newStatus, id]
-    );
+      await txQuery(
+        `
+        UPDATE departments 
+        SET status = $1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        `,
+        [newStatus, id]
+      );
 
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_STATUS_TOGGLE',
-      entityType: 'DEPARTMENT',
-      entityId: String(id),
-      details: `Toggled status for department "${dept.name}" [${dept.dept_code}] to ${newStatus}`,
-      ipAddress,
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_STATUS_TOGGLE',
+          entityType: 'DEPARTMENT',
+          entityId: String(id),
+          details: `Toggled status for department "${dept.name}" [${dept.dept_code}] to ${newStatus}`,
+          ipAddress,
+        },
+        txQuery
+      );
     });
 
     const full = await this.getDepartmentById(id);
@@ -629,7 +717,7 @@ export class DepartmentService {
   }
 
   /**
-   * Assign or replace department manager (explicit manager action)
+   * Assign or replace department manager inside an atomic transaction
    */
   static async assignManager(
     id: number,
@@ -638,56 +726,59 @@ export class DepartmentService {
     actorId: number,
     ipAddress?: string
   ): Promise<DepartmentWithDetails> {
-    const existing = await query('SELECT * FROM departments WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      throw new Error(`Department with ID ${id} not found.`);
-    }
-    const dept = existing.rows[0];
-
-    if (managerId !== null) {
-      const userCheck = await query('SELECT id, full_name, username FROM users WHERE id = $1', [managerId]);
-      if (userCheck.rows.length === 0) {
-        throw new Error(`User with ID ${managerId} not found.`);
+    await withTransaction(async (txQuery) => {
+      const existing = await txQuery('SELECT * FROM departments WHERE id = $1 FOR UPDATE', [id]);
+      if (existing.rows.length === 0) {
+        throw notFound(`Department with ID ${id} not found.`);
       }
-    }
+      const dept = existing.rows[0];
 
-    // Close previous tenure
-    await query(
-      `
-      UPDATE department_manager_history 
-      SET relinquished_at = CURRENT_TIMESTAMP
-      WHERE department_id = $1 AND relinquished_at IS NULL
-      `,
-      [id]
-    );
+      if (managerId !== null) {
+        const userCheck = await txQuery('SELECT id, full_name, username FROM users WHERE id = $1', [managerId]);
+        if (userCheck.rows.length === 0) {
+          throw notFound(`User with ID ${managerId} not found.`);
+        }
+      }
 
-    // Record new tenure if not unassigning
-    if (managerId !== null) {
-      await query(
+      await txQuery(
         `
-        INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
-        VALUES ($1, $2, $3, $4)
+        UPDATE department_manager_history 
+        SET relinquished_at = CURRENT_TIMESTAMP
+        WHERE department_id = $1 AND relinquished_at IS NULL
         `,
-        [id, managerId, actorId, notes?.trim() || 'Assigned via Manager Assignment interface']
+        [id]
       );
-    }
 
-    await query(
-      `
-      UPDATE departments 
-      SET manager_id = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2
-      `,
-      [managerId, id]
-    );
+      if (managerId !== null) {
+        await txQuery(
+          `
+          INSERT INTO department_manager_history (department_id, manager_id, assigned_by, notes)
+          VALUES ($1, $2, $3, $4)
+          `,
+          [id, managerId, actorId, notes?.trim() || 'Assigned via Manager Assignment interface']
+        );
+      }
 
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_MANAGER_ASSIGN',
-      entityType: 'DEPARTMENT',
-      entityId: String(id),
-      details: `Manager for department "${dept.name}" changed from #${dept.manager_id ?? 'None'} to #${managerId ?? 'Unassigned'}`,
-      ipAddress,
+      await txQuery(
+        `
+        UPDATE departments 
+        SET manager_id = $1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        `,
+        [managerId, id]
+      );
+
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_MANAGER_ASSIGN',
+          entityType: 'DEPARTMENT',
+          entityId: String(id),
+          details: `Manager for department "${dept.name}" changed from #${dept.manager_id ?? 'None'} to #${managerId ?? 'Unassigned'}`,
+          ipAddress,
+        },
+        txQuery
+      );
     });
 
     const full = await this.getDepartmentById(id);
@@ -702,75 +793,75 @@ export class DepartmentService {
     dto: AssignEmployeeDTO,
     actorId: number,
     ipAddress?: string,
-    txQuery: QueryFn = query
+    txQuery?: QueryFn
   ): Promise<DepartmentEmployee> {
-    const [deptRes, userRes] = await Promise.all([
-      txQuery('SELECT id, name FROM departments WHERE id = $1', [deptId]),
-      txQuery('SELECT id, full_name, username FROM users WHERE id = $1', [dto.user_id]),
-    ]);
+    const exec = async (runQuery: QueryFn): Promise<DepartmentEmployee> => {
+      const [deptRes, userRes] = await Promise.all([
+        runQuery('SELECT id, name FROM departments WHERE id = $1', [deptId]),
+        runQuery('SELECT id, full_name, username FROM users WHERE id = $1', [dto.user_id]),
+      ]);
 
-    if (deptRes.rows.length === 0) {
-      const err: any = new Error(`Department with ID ${deptId} not found.`);
-      err.statusCode = 404;
-      throw err;
+      if (deptRes.rows.length === 0) {
+        throw notFound(`Department with ID ${deptId} not found.`);
+      }
+      if (userRes.rows.length === 0) {
+        throw notFound(`User with ID ${dto.user_id} not found.`);
+      }
+
+      const dept = deptRes.rows[0];
+      const user = userRes.rows[0];
+      const pos = dto.position_title.trim() || 'Staff';
+      const isPrimary = dto.is_primary !== undefined ? dto.is_primary : true;
+
+      if (isPrimary) {
+        await runQuery('UPDATE department_employees SET is_primary = FALSE WHERE user_id = $1', [dto.user_id]);
+      }
+
+      await runQuery(
+        `
+        INSERT INTO department_employees (department_id, user_id, position_title, is_primary, notes)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (department_id, user_id) 
+        DO UPDATE SET position_title = $3, is_primary = $4, notes = $5, assigned_at = CURRENT_TIMESTAMP
+        `,
+        [deptId, dto.user_id, pos, isPrimary, dto.notes?.trim() || null]
+      );
+
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_EMPLOYEE_ASSIGN',
+          entityType: 'DEPARTMENT',
+          entityId: String(deptId),
+          details: `Assigned user @${user.username} (${user.full_name}) as "${pos}" in department "${dept.name}" (Primary: ${isPrimary})`,
+          ipAddress,
+        },
+        runQuery
+      );
+
+      const empRes = await runQuery(
+        `
+        SELECT 
+          de.id, de.department_id, de.user_id, de.position_title, de.is_primary, de.assigned_at, de.notes,
+          u.username, u.full_name, u.is_active as user_is_active
+        FROM department_employees de
+        JOIN users u ON de.user_id = u.id
+        WHERE de.department_id = $1 AND de.user_id = $2
+        `,
+        [deptId, dto.user_id]
+      );
+
+      return empRes.rows[0];
+    };
+
+    if (txQuery) {
+      return exec(txQuery);
     }
-    if (userRes.rows.length === 0) {
-      const err: any = new Error(`User with ID ${dto.user_id} not found.`);
-      err.statusCode = 404;
-      throw err;
-    }
-
-    const dept = deptRes.rows[0];
-    const user = userRes.rows[0];
-    const pos = dto.position_title.trim() || 'Staff';
-    const isPrimary = dto.is_primary !== undefined ? dto.is_primary : true;
-
-    // If marked primary, unset primary on other assignments for this user if specified
-    if (isPrimary) {
-      await txQuery('UPDATE department_employees SET is_primary = FALSE WHERE user_id = $1', [dto.user_id]);
-    }
-
-    // Upsert into department_employees
-    await txQuery(
-      `
-      INSERT INTO department_employees (department_id, user_id, position_title, is_primary, notes)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (department_id, user_id) 
-      DO UPDATE SET position_title = $3, is_primary = $4, notes = $5, assigned_at = CURRENT_TIMESTAMP
-      `,
-      [deptId, dto.user_id, pos, isPrimary, dto.notes?.trim() || null]
-    );
-
-    await AuditService.log(
-      {
-        userId: actorId,
-        action: 'DEPT_EMPLOYEE_ASSIGN',
-        entityType: 'DEPARTMENT',
-        entityId: String(deptId),
-        details: `Assigned user @${user.username} (${user.full_name}) as "${pos}" in department "${dept.name}" (Primary: ${isPrimary})`,
-        ipAddress,
-      },
-      txQuery
-    );
-
-    const empRes = await txQuery(
-      `
-      SELECT 
-        de.id, de.department_id, de.user_id, de.position_title, de.is_primary, de.assigned_at, de.notes,
-        u.username, u.full_name, u.is_active as user_is_active
-      FROM department_employees de
-      JOIN users u ON de.user_id = u.id
-      WHERE de.department_id = $1 AND de.user_id = $2
-      `,
-      [deptId, dto.user_id]
-    );
-
-    return empRes.rows[0];
+    return withTransaction(exec);
   }
 
   /**
    * Transfer an employee from one department to another inside an atomic transaction.
-   * Enforces authorization on BOTH source and target departments for non-global managers.
    */
   static async transferEmployee(
     sourceDeptId: number,
@@ -783,9 +874,7 @@ export class DepartmentService {
     actorPermissions?: string[]
   ): Promise<DepartmentEmployee> {
     if (sourceDeptId === targetDeptId) {
-      const err: any = new Error('Source and target departments must be different for transfer.');
-      err.statusCode = 400;
-      throw err;
+      throw badRequest('Source and target departments must be different for transfer.');
     }
 
     const [srcRes, tgtRes, userRes] = await Promise.all([
@@ -804,41 +893,30 @@ export class DepartmentService {
     ]);
 
     if (srcRes.rows.length === 0 || tgtRes.rows.length === 0 || userRes.rows.length === 0) {
-      const err: any = new Error('Invalid source department, target department, or user ID.');
-      err.statusCode = 404;
-      throw err;
+      throw notFound('Invalid source department, target department, or user ID.');
     }
 
     const srcDept = srcRes.rows[0];
     const tgtDept = tgtRes.rows[0];
 
-    // Defense-in-depth service authorization check for BOTH source and target departments
     if (actorPermissions !== undefined && !actorPermissions.includes('departments:manage_employees')) {
       if (!actorPermissions.includes('departments:scoped:manage')) {
-        const err: any = new Error('Transferring employees requires department management permissions.');
-        err.statusCode = 403;
-        err.code = 'FORBIDDEN';
-        throw err;
+        throw forbidden('Transferring employees requires department management permissions.');
       }
 
       if (srcDept.manager_id !== actorId || tgtDept.manager_id !== actorId) {
-        const err: any = new Error(
+        throw forbidden(
           'Access denied. Department Managers may only transfer employees between departments they are authorized to manage.'
         );
-        err.statusCode = 403;
-        err.code = 'FORBIDDEN';
-        throw err;
       }
     }
 
     return withTransaction(async (txQuery) => {
-      // Delete from source department
       await txQuery('DELETE FROM department_employees WHERE department_id = $1 AND user_id = $2', [
         sourceDeptId,
         userId,
       ]);
 
-      // Assign to target department inside the same transaction
       const assigned = await this.assignEmployee(
         targetDeptId,
         {
@@ -869,7 +947,7 @@ export class DepartmentService {
   }
 
   /**
-   * Remove employee assignment from department
+   * Remove employee assignment from department inside a transaction
    */
   static async removeEmployee(
     deptId: number,
@@ -877,75 +955,84 @@ export class DepartmentService {
     actorId: number,
     ipAddress?: string
   ): Promise<void> {
-    const [deptRes, userRes] = await Promise.all([
-      query('SELECT id, name FROM departments WHERE id = $1', [deptId]),
-      query('SELECT id, username, full_name FROM users WHERE id = $1', [userId]),
-    ]);
+    await withTransaction(async (txQuery) => {
+      const [deptRes, userRes] = await Promise.all([
+        txQuery('SELECT id, name FROM departments WHERE id = $1', [deptId]),
+        txQuery('SELECT id, username, full_name FROM users WHERE id = $1', [userId]),
+      ]);
 
-    if (deptRes.rows.length === 0 || userRes.rows.length === 0) {
-      throw new Error('Department or user not found.');
-    }
+      if (deptRes.rows.length === 0 || userRes.rows.length === 0) {
+        throw notFound('Department or user not found.');
+      }
 
-    await query('DELETE FROM department_employees WHERE department_id = $1 AND user_id = $2', [deptId, userId]);
+      await txQuery('DELETE FROM department_employees WHERE department_id = $1 AND user_id = $2', [deptId, userId]);
 
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_EMPLOYEE_REMOVE',
-      entityType: 'DEPARTMENT',
-      entityId: String(deptId),
-      details: `Removed user @${userRes.rows[0].username} (${userRes.rows[0].full_name}) from department "${deptRes.rows[0].name}"`,
-      ipAddress,
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_EMPLOYEE_REMOVE',
+          entityType: 'DEPARTMENT',
+          entityId: String(deptId),
+          details: `Removed user @${userRes.rows[0].username} (${userRes.rows[0].full_name}) from department "${deptRes.rows[0].name}"`,
+          ipAddress,
+        },
+        txQuery
+      );
     });
   }
 
   /**
-   * Safe deletion verification (Section 4):
-   * "A department with historical records or assigned employees must not be permanently deleted. Deactivation should be used instead."
+   * Safe deletion verification inside an atomic transaction
    */
   static async deleteDepartment(
     id: number,
     actorId: number,
     ipAddress?: string
   ): Promise<void> {
-    const existing = await query('SELECT * FROM departments WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      throw new Error(`Department with ID ${id} not found.`);
-    }
-    const dept = existing.rows[0];
+    await withTransaction(async (txQuery) => {
+      const existing = await txQuery('SELECT * FROM departments WHERE id = $1 FOR UPDATE', [id]);
+      if (existing.rows.length === 0) {
+        throw notFound(`Department with ID ${id} not found.`);
+      }
+      const dept = existing.rows[0];
 
-    // Check for assigned employees
-    const empCheck = await query('SELECT count(*) as count FROM department_employees WHERE department_id = $1', [id]);
-    if (parseInt(empCheck.rows[0].count, 10) > 0) {
-      throw new Error(
-        `Safety restriction: Department "${dept.name}" has ${empCheck.rows[0].count} assigned employees and cannot be deleted. Use deactivation to preserve organizational audit records.`
+      const empCheck = await txQuery('SELECT count(*) as count FROM department_employees WHERE department_id = $1', [id]);
+      if (parseInt(empCheck.rows[0].count, 10) > 0) {
+        throw conflict(
+          `Safety restriction: Department "${dept.name}" has ${empCheck.rows[0].count} assigned employees and cannot be deleted. Use deactivation to preserve organizational audit records.`,
+          'DEPARTMENT_HAS_EMPLOYEES'
+        );
+      }
+
+      const subCheck = await txQuery('SELECT count(*) as count FROM departments WHERE parent_id = $1', [id]);
+      if (parseInt(subCheck.rows[0].count, 10) > 0) {
+        throw conflict(
+          `Safety restriction: Department "${dept.name}" has ${subCheck.rows[0].count} sub-departments. You must reassign or remove sub-departments before deleting.`,
+          'DEPARTMENT_HAS_SUBDEPARTMENTS'
+        );
+      }
+
+      const lineCheck = await txQuery('SELECT count(*) as count FROM production_lines WHERE department_id = $1', [id]);
+      if (parseInt(lineCheck.rows[0].count, 10) > 0) {
+        throw conflict(
+          `Safety restriction: Department "${dept.name}" is referenced by ${lineCheck.rows[0].count} production lines. Use deactivation instead.`,
+          'DEPARTMENT_HAS_LINES'
+        );
+      }
+
+      await txQuery('DELETE FROM departments WHERE id = $1', [id]);
+
+      await AuditService.log(
+        {
+          userId: actorId,
+          action: 'DEPT_DELETE',
+          entityType: 'DEPARTMENT',
+          entityId: String(id),
+          details: `Permanently deleted unused empty department "${dept.name}" [${dept.dept_code}]`,
+          ipAddress,
+        },
+        txQuery
       );
-    }
-
-    // Check for sub-departments
-    const subCheck = await query('SELECT count(*) as count FROM departments WHERE parent_id = $1', [id]);
-    if (parseInt(subCheck.rows[0].count, 10) > 0) {
-      throw new Error(
-        `Safety restriction: Department "${dept.name}" has ${subCheck.rows[0].count} sub-departments. You must reassign or remove sub-departments before deleting.`
-      );
-    }
-
-    // Check for production lines linked
-    const lineCheck = await query('SELECT count(*) as count FROM production_lines WHERE department_id = $1', [id]);
-    if (parseInt(lineCheck.rows[0].count, 10) > 0) {
-      throw new Error(
-        `Safety restriction: Department "${dept.name}" is referenced by ${lineCheck.rows[0].count} production lines. Use deactivation instead.`
-      );
-    }
-
-    await query('DELETE FROM departments WHERE id = $1', [id]);
-
-    await AuditService.log({
-      userId: actorId,
-      action: 'DEPT_DELETE',
-      entityType: 'DEPARTMENT',
-      entityId: String(id),
-      details: `Permanently deleted unused empty department "${dept.name}" [${dept.dept_code}]`,
-      ipAddress,
     });
   }
 }

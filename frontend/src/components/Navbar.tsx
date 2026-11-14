@@ -1,7 +1,6 @@
 import React from 'react';
 import {
   Factory,
-  Shield,
   Users,
   FileText,
   Activity,
@@ -11,11 +10,23 @@ import {
   Code2,
   Layers,
   Building2,
+  ClipboardList,
+  Boxes,
 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth.tsx';
 import { HealthCheckData } from '../types/index.ts';
 
-export type ActiveTab = 'dashboard' | 'production' | 'departments' | 'my-department' | 'users' | 'audit' | 'diagnostics' | 'architecture';
+export type ActiveTab =
+  | 'dashboard'
+  | 'warehouse'
+  | 'production'
+  | 'departments'
+  | 'my-department'
+  | 'planning'
+  | 'users'
+  | 'audit'
+  | 'diagnostics'
+  | 'architecture';
 
 interface NavbarProps {
   activeTab: ActiveTab;
@@ -28,6 +39,18 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
 
   const isDbConnected = health?.database?.status === 'CONNECTED';
   const isApiUp = health?.status === 'UP';
+  const isDeptManager =
+    hasRole('Department Manager') &&
+    !hasRole('Factory Manager') &&
+    !hasRole('System Administrator') &&
+    (hasPermission('departments:scoped:view') || hasPermission('departments:scoped:manage')) &&
+    Boolean(user?.managed_department_ids && user.managed_department_ids.length > 0);
+  const canViewPlanning = hasPermission('planning:view') || hasPermission('planning:manage');
+  const canViewWarehouse =
+    hasPermission('warehouse:view') ||
+    hasPermission('inventory:requisition:create') ||
+    hasPermission('inventory:qc_inspect') ||
+    hasPermission('inventory:return');
 
   return (
     <header className="bg-slate-900 border-b border-slate-800 text-slate-100 sticky top-0 z-30">
@@ -42,7 +65,7 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               <div className="flex items-center space-x-2">
                 <span className="font-bold tracking-tight text-lg text-white">GFMS</span>
                 <span className="text-xs uppercase px-1.5 py-0.5 rounded bg-slate-800 text-indigo-400 font-mono font-medium border border-slate-700">
-                  v0.2 Production Setup
+                  v0.3 Operations
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 font-medium">Garment Factory Management System</p>
@@ -50,10 +73,10 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
           </div>
 
           {/* Navigation Links */}
-          <nav className="hidden md:flex items-center space-x-1">
+          <nav className="hidden md:flex items-center space-x-1 flex-wrap">
             <button
               onClick={() => setActiveTab('dashboard')}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+              className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                 activeTab === 'dashboard'
                   ? 'bg-slate-800 text-white border border-slate-700'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -63,10 +86,24 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               <span>Dashboard</span>
             </button>
 
+            {canViewWarehouse && (
+              <button
+                onClick={() => setActiveTab('warehouse')}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
+                  activeTab === 'warehouse'
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'text-indigo-300 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <Boxes className="w-3.5 h-3.5 text-indigo-300" />
+                <span>Warehouse &amp; Inventory</span>
+              </button>
+            )}
+
             {hasPermission('production:view') && (
               <button
                 onClick={() => setActiveTab('production')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'production'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -80,7 +117,7 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
             {hasPermission('departments:view') && (
               <button
                 onClick={() => setActiveTab('departments')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'departments'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -91,10 +128,10 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               </button>
             )}
 
-            {user?.managed_department_ids && user.managed_department_ids.length > 0 && (
+            {isDeptManager && (
               <button
                 onClick={() => setActiveTab('my-department')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'my-department'
                     ? 'bg-indigo-600 text-white shadow-sm'
                     : 'text-indigo-300 hover:text-white hover:bg-slate-800/60'
@@ -105,24 +142,38 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
               </button>
             )}
 
+            {canViewPlanning && (
+              <button
+                onClick={() => setActiveTab('planning')}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
+                  activeTab === 'planning'
+                    ? 'bg-amber-600 text-white shadow-sm'
+                    : 'text-amber-300 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <ClipboardList className="w-3.5 h-3.5 text-amber-300" />
+                <span>Planning</span>
+              </button>
+            )}
+
             {hasPermission('users:read') && (
               <button
                 onClick={() => setActiveTab('users')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'users'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
                 }`}
               >
                 <Users className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Users & Roles</span>
+                <span>Users &amp; Roles</span>
               </button>
             )}
 
             {hasPermission('audit:read') && (
               <button
                 onClick={() => setActiveTab('audit')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'audit'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -136,7 +187,7 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
             {hasRole('System Administrator') && (
               <button
                 onClick={() => setActiveTab('diagnostics')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'diagnostics'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
@@ -150,14 +201,14 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
             {(hasRole('System Administrator') || hasRole('Factory Manager')) && (
               <button
                 onClick={() => setActiveTab('architecture')}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors ${
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
                   activeTab === 'architecture'
                     ? 'bg-slate-800 text-white border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
                 }`}
               >
                 <Code2 className="w-3.5 h-3.5 text-amber-400" />
-                <span>Architecture & Export</span>
+                <span>Architecture &amp; Export</span>
               </button>
             )}
           </nav>
@@ -217,6 +268,98 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, health 
             ) : null}
           </div>
         </div>
+
+        {/* Mobile / Narrow Viewport Navigation Strip */}
+        <nav className="flex md:hidden items-center gap-1 overflow-x-auto pb-2.5 pt-1 border-t border-slate-800/70">
+          <button
+            onClick={() => setActiveTab('dashboard')}
+            className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+              activeTab === 'dashboard' ? 'bg-slate-800 text-white' : 'text-slate-400'
+            }`}
+          >
+            Dashboard
+          </button>
+          {canViewWarehouse && (
+            <button
+              onClick={() => setActiveTab('warehouse')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'warehouse' ? 'bg-indigo-600 text-white' : 'text-indigo-300'
+              }`}
+            >
+              Warehouse
+            </button>
+          )}
+          {hasPermission('production:view') && (
+            <button
+              onClick={() => setActiveTab('production')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'production' ? 'bg-slate-800 text-white' : 'text-slate-400'
+              }`}
+            >
+              Production
+            </button>
+          )}
+          {hasPermission('departments:view') && (
+            <button
+              onClick={() => setActiveTab('departments')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'departments' ? 'bg-slate-800 text-white' : 'text-slate-400'
+              }`}
+            >
+              Departments
+            </button>
+          )}
+          {isDeptManager && (
+            <button
+              onClick={() => setActiveTab('my-department')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'my-department' ? 'bg-indigo-600 text-white' : 'text-indigo-300'
+              }`}
+            >
+              My Dept
+            </button>
+          )}
+          {canViewPlanning && (
+            <button
+              onClick={() => setActiveTab('planning')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'planning' ? 'bg-amber-600 text-white' : 'text-amber-300'
+              }`}
+            >
+              Planning
+            </button>
+          )}
+          {hasPermission('users:read') && (
+            <button
+              onClick={() => setActiveTab('users')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'users' ? 'bg-slate-800 text-white' : 'text-slate-400'
+              }`}
+            >
+              Users
+            </button>
+          )}
+          {hasPermission('audit:read') && (
+            <button
+              onClick={() => setActiveTab('audit')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'audit' ? 'bg-slate-800 text-white' : 'text-slate-400'
+              }`}
+            >
+              Audit
+            </button>
+          )}
+          {hasRole('System Administrator') && (
+            <button
+              onClick={() => setActiveTab('diagnostics')}
+              className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
+                activeTab === 'diagnostics' ? 'bg-slate-800 text-white' : 'text-slate-400'
+              }`}
+            >
+              Tests
+            </button>
+          )}
+        </nav>
       </div>
     </header>
   );

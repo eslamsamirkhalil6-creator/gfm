@@ -1,4 +1,4 @@
-import { query, withTransaction } from '../../config/database.ts';
+import { query, sqlEqInt, sqlEqText, withTransaction } from '../../config/database.ts';
 import { hasGlobalWarehouseAccess } from '../../middleware/auth.middleware.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import { InventoryEngineService } from './inventory-engine.service.ts';
@@ -14,7 +14,12 @@ import {
   parsePositiveNumber,
   roundQty,
 } from './warehouse.errors.ts';
-import { ADJUSTMENT_REASON_CODES, STOCK_STATUSES, WarehouseActor } from './warehouse.types.ts';
+import {
+  ADJUSTMENT_REASON_CODES,
+  isCategoryCompatibleWithWarehouse,
+  STOCK_STATUSES,
+  WarehouseActor,
+} from './warehouse.types.ts';
 
 export class WarehouseControlService {
   // ============================================================================
@@ -26,19 +31,22 @@ export class WarehouseControlService {
     let sql = `
       SELECT t.*,
              sw.warehouse_code as source_warehouse_code, sw.name as source_warehouse_name,
-             tw.warehouse_code as target_warehouse_code, tw.name as target_warehouse_name
+             tw.warehouse_code as target_warehouse_code, tw.name as target_warehouse_name,
+             COALESCE(du.username, cu.username) as initiated_by_username
       FROM warehouse_transfers t
       JOIN warehouses sw ON t.source_warehouse_id = sw.id
       JOIN warehouses tw ON t.target_warehouse_id = tw.id
+      LEFT JOIN users du ON t.dispatched_by = du.id
+      LEFT JOIN users cu ON t.created_by = cu.id
       WHERE 1=1
     `;
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND t.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('t.status', `$${params.length}`)}`;
     }
     if (filter?.transfer_type) {
       params.push(filter.transfer_type);
-      sql += ` AND t.transfer_type = $${params.length}`;
+      sql += ` AND ${sqlEqText('t.transfer_type', `$${params.length}`)}`;
     }
     sql += ` ORDER BY t.id DESC`;
 
@@ -52,10 +60,13 @@ export class WarehouseControlService {
   static async getTransferById(transferId: number, actor: WarehouseActor): Promise<any> {
     const res = await query<any>(
       `SELECT t.*,
-              sw.warehouse_code as source_warehouse_code, tw.warehouse_code as target_warehouse_code
+              sw.warehouse_code as source_warehouse_code, tw.warehouse_code as target_warehouse_code,
+              COALESCE(du.username, cu.username) as initiated_by_username
        FROM warehouse_transfers t
        JOIN warehouses sw ON t.source_warehouse_id = sw.id
        JOIN warehouses tw ON t.target_warehouse_id = tw.id
+       LEFT JOIN users du ON t.dispatched_by = du.id
+       LEFT JOIN users cu ON t.created_by = cu.id
        WHERE t.id = $1`,
       [transferId]
     );
@@ -76,7 +87,7 @@ export class WarehouseControlService {
        JOIN materials m ON ti.material_id = m.id
        JOIN warehouse_locations sl ON ti.source_location_id = sl.id
        JOIN warehouse_locations tl ON ti.target_location_id = tl.id
-       WHERE ti.transfer_id + 0 = $1
+       WHERE ${sqlEqInt('ti.transfer_id', '$1')}
        ORDER BY ti.id ASC`,
       [transferId]
     );
@@ -107,6 +118,16 @@ export class WarehouseControlService {
     }
 
     return withTransaction(async (txQuery) => {
+      const whRes = await txQuery<any>(
+        `SELECT id, warehouse_code, warehouse_type, status FROM warehouses WHERE id = $1`,
+        [warehouseId]
+      );
+      if (whRes.rowCount === 0) throw notFound(`Warehouse #${warehouseId} not found`);
+      const wh = whRes.rows[0];
+      if (wh.status !== 'active') {
+        throw badRequest(`Warehouse ${wh.warehouse_code} is inactive`, 'INACTIVE_WAREHOUSE');
+      }
+
       const transferNumber = generateDocRef('BIN');
       const trfIns = await txQuery<any>(
         `INSERT INTO warehouse_transfers (
@@ -129,6 +150,25 @@ export class WarehouseControlService {
         const materialId = parsePositiveInt(itemDto.material_id, 'material_id');
         const qty = parsePositiveNumber(itemDto.quantity, 'quantity');
         const lotId = itemDto.lot_id ? parsePositiveInt(itemDto.lot_id, 'lot_id') : null;
+
+        const matRes = await txQuery<any>(
+          `SELECT m.id, m.sku, m.status, mc.category_type
+           FROM materials m
+           JOIN material_categories mc ON m.category_id = mc.id
+           WHERE m.id = $1`,
+          [materialId]
+        );
+        if (matRes.rowCount === 0) throw notFound(`Material #${materialId} not found`);
+        const mat = matRes.rows[0];
+        if (mat.status !== 'active') {
+          throw badRequest(`Material ${mat.sku} is inactive and cannot be transferred`, 'INACTIVE_MATERIAL');
+        }
+        if (!isCategoryCompatibleWithWarehouse(wh.warehouse_type, mat.category_type)) {
+          throw badRequest(
+            `Material ${mat.sku} (${mat.category_type}) is incompatible with warehouse ${wh.warehouse_code} (${wh.warehouse_type})`,
+            'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+          );
+        }
 
         await InventoryEngineService.resolveLocationForWarehouse(txQuery, warehouseId, srcLocId);
         await InventoryEngineService.resolveLocationForWarehouse(txQuery, warehouseId, tgtLocId);
@@ -233,6 +273,25 @@ export class WarehouseControlService {
     }
 
     return withTransaction(async (txQuery) => {
+      if (!hasGlobalWarehouseAccess(actor as any) && !actor.managed_warehouse_ids.includes(srcWhId)) {
+        throw forbidden(`Source Warehouse #${srcWhId} is outside your assigned warehouse scope`);
+      }
+
+      const [srcWhRes, tgtWhRes] = await Promise.all([
+        txQuery<any>(`SELECT id, warehouse_code, warehouse_type, status FROM warehouses WHERE id = $1`, [srcWhId]),
+        txQuery<any>(`SELECT id, warehouse_code, warehouse_type, status FROM warehouses WHERE id = $1`, [tgtWhId]),
+      ]);
+      if (srcWhRes.rowCount === 0) throw notFound(`Source Warehouse #${srcWhId} not found`);
+      if (tgtWhRes.rowCount === 0) throw notFound(`Target Warehouse #${tgtWhId} not found`);
+      const srcWh = srcWhRes.rows[0];
+      const tgtWh = tgtWhRes.rows[0];
+      if (srcWh.status !== 'active') {
+        throw badRequest(`Source warehouse ${srcWh.warehouse_code} is inactive`, 'INACTIVE_WAREHOUSE');
+      }
+      if (tgtWh.status !== 'active') {
+        throw badRequest(`Target warehouse ${tgtWh.warehouse_code} is inactive`, 'INACTIVE_WAREHOUSE');
+      }
+
       const transferNumber = generateDocRef('TRF');
       const trfIns = await txQuery<any>(
         `INSERT INTO warehouse_transfers (
@@ -250,6 +309,38 @@ export class WarehouseControlService {
         const materialId = parsePositiveInt(itemDto.material_id, 'material_id');
         const qty = parsePositiveNumber(itemDto.dispatched_qty ?? (itemDto as any).quantity, 'dispatched_qty');
         const lotId = itemDto.lot_id ? parsePositiveInt(itemDto.lot_id, 'lot_id') : null;
+
+        const matRes = await txQuery<any>(
+          `SELECT m.id, m.sku, m.status, mc.category_type
+           FROM materials m
+           JOIN material_categories mc ON m.category_id = mc.id
+           WHERE m.id = $1`,
+          [materialId]
+        );
+        if (matRes.rowCount === 0) throw notFound(`Material #${materialId} not found`);
+        const mat = matRes.rows[0];
+        if (mat.status !== 'active') {
+          throw badRequest(`Material ${mat.sku} is inactive and cannot be transferred`, 'INACTIVE_MATERIAL');
+        }
+        if (!isCategoryCompatibleWithWarehouse(srcWh.warehouse_type, mat.category_type)) {
+          throw badRequest(
+            `Material ${mat.sku} (${mat.category_type}) is incompatible with source warehouse ${srcWh.warehouse_code} (${srcWh.warehouse_type})`,
+            'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+          );
+        }
+        if (!isCategoryCompatibleWithWarehouse(tgtWh.warehouse_type, mat.category_type)) {
+          throw badRequest(
+            `Material ${mat.sku} (${mat.category_type}) is incompatible with destination warehouse ${tgtWh.warehouse_code} (${tgtWh.warehouse_type})`,
+            'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+          );
+        }
+        if (lotId !== null) {
+          const lotRes = await txQuery<any>(`SELECT id, material_id FROM inventory_lots WHERE id = $1`, [lotId]);
+          if (lotRes.rowCount === 0) throw notFound(`Lot #${lotId} not found`);
+          if (lotRes.rows[0].material_id !== materialId) {
+            throw badRequest(`Lot #${lotId} does not belong to Material ${mat.sku}`, 'LOT_MATERIAL_MISMATCH');
+          }
+        }
 
         const srcResolved = await InventoryEngineService.resolveLocationForWarehouse(
           txQuery,
@@ -385,10 +476,21 @@ export class WarehouseControlService {
         throw conflict(`Transfer ${transfer.transfer_number} is already "${transfer.status}"`, 'ALREADY_RECEIVED');
       }
 
-      const dbItemsRes = await txQuery<any>(
-        `SELECT * FROM warehouse_transfer_items WHERE transfer_id = $1 FOR UPDATE`,
-        [transferId]
-      );
+      const [srcWhRes, tgtWhRes, dbItemsRes] = await Promise.all([
+        txQuery<any>(`SELECT id, warehouse_code, warehouse_type, status FROM warehouses WHERE id = $1`, [transfer.source_warehouse_id]),
+        txQuery<any>(`SELECT id, warehouse_code, warehouse_type, status FROM warehouses WHERE id = $1`, [transfer.target_warehouse_id]),
+        txQuery<any>(
+          `SELECT * FROM warehouse_transfer_items WHERE transfer_id = $1 FOR UPDATE`,
+          [transferId]
+        ),
+      ]);
+      if (tgtWhRes.rowCount === 0) throw notFound(`Target Warehouse #${transfer.target_warehouse_id} not found`);
+      const tgtWh = tgtWhRes.rows[0];
+      const srcWh = srcWhRes.rows[0];
+      if (tgtWh.status !== 'active') {
+        throw badRequest(`Target warehouse ${tgtWh.warehouse_code} is inactive`, 'INACTIVE_WAREHOUSE');
+      }
+
       const dbItemMap = new Map<number, any>(dbItemsRes.rows.map((r) => [r.id, r]));
       if (dto.items.length !== dbItemsRes.rowCount) {
         throw badRequest('All transfer lines must be accounted for on receipt');
@@ -401,6 +503,28 @@ export class WarehouseControlService {
         const tiId = parsePositiveInt(itemDto.transfer_item_id, 'transfer_item_id');
         const dbItem = dbItemMap.get(tiId);
         if (!dbItem) throw notFound(`Transfer item #${tiId} not found on Transfer #${transferId}`);
+
+        const matCatRes = await txQuery<any>(
+          `SELECT m.id, m.sku, mc.category_type
+           FROM materials m
+           JOIN material_categories mc ON m.category_id = mc.id
+           WHERE m.id = $1`,
+          [dbItem.material_id]
+        );
+        if (matCatRes.rowCount === 0) throw notFound(`Material #${dbItem.material_id} not found`);
+        const matCat = matCatRes.rows[0];
+        if (srcWh && !isCategoryCompatibleWithWarehouse(srcWh.warehouse_type, matCat.category_type)) {
+          throw badRequest(
+            `Material ${matCat.sku} (${matCat.category_type}) is incompatible with source warehouse ${srcWh.warehouse_code} (${srcWh.warehouse_type})`,
+            'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+          );
+        }
+        if (!isCategoryCompatibleWithWarehouse(tgtWh.warehouse_type, matCat.category_type)) {
+          throw badRequest(
+            `Material ${matCat.sku} (${matCat.category_type}) is incompatible with destination warehouse ${tgtWh.warehouse_code} (${tgtWh.warehouse_type})`,
+            'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+          );
+        }
 
         const receivedQty = parseNonNegativeNumber(itemDto.received_qty, 'received_qty', 0);
         const damagedQty = parseNonNegativeNumber(itemDto.damaged_qty, 'damaged_qty', 0);
@@ -560,11 +684,11 @@ export class WarehouseControlService {
     `;
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND sc.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sc.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND sc.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('sc.status', `$${params.length}`)}`;
     }
     sql += ` ORDER BY sc.id DESC`;
     const res = await query<any>(sql, params);
@@ -595,16 +719,16 @@ export class WarehouseControlService {
       let balSql = `
         SELECT warehouse_id, location_id, material_id, lot_id, stock_status, qty_on_hand
         FROM inventory_balances
-        WHERE warehouse_id + 0 = $1
+        WHERE ${sqlEqInt('warehouse_id', '$1')}
           AND stock_status IN ('AVAILABLE', 'QUARANTINE', 'HOLD', 'DAMAGED', 'SCRAP')
       `;
       if (dto.material_id) {
         params.push(parsePositiveInt(dto.material_id, 'material_id'));
-        balSql += ` AND material_id + 0 = $${params.length}`;
+        balSql += ` AND ${sqlEqInt('material_id', `$${params.length}`)}`;
       }
       if (dto.location_id) {
         params.push(parsePositiveInt(dto.location_id, 'location_id'));
-        balSql += ` AND location_id + 0 = $${params.length}`;
+        balSql += ` AND ${sqlEqInt('location_id', `$${params.length}`)}`;
       }
       balSql += ` ORDER BY id ASC`;
 
@@ -648,7 +772,7 @@ export class WarehouseControlService {
        FROM stock_count_items sci
        JOIN materials m ON sci.material_id = m.id
        JOIN warehouse_locations l ON sci.location_id = l.id
-       WHERE sci.count_id + 0 = $1 ORDER BY sci.id ASC`,
+       WHERE ${sqlEqInt('sci.count_id', '$1')} ORDER BY sci.id ASC`,
       [countId]
     );
     return { stock_count: sc, items: itemsRes.rows };
@@ -921,11 +1045,11 @@ export class WarehouseControlService {
     `;
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND sa.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('sa.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND sa.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('sa.status', `$${params.length}`)}`;
     }
     sql += ` ORDER BY sa.id DESC`;
     const res = await query<any>(sql, params);
@@ -1207,11 +1331,11 @@ export class WarehouseControlService {
     `;
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND rr.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('rr.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND rr.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('rr.status', `$${params.length}`)}`;
     }
     sql += ` ORDER BY rr.id DESC`;
     const res = await query<any>(sql, params);

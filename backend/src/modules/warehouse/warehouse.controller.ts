@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { hasGlobalWarehouseAccess } from '../../middleware/auth.middleware.ts';
+import { canCreateOrManageAllWarehouses } from '../../middleware/auth.middleware.ts';
 import { WarehouseControlService } from './warehouse-control.service.ts';
 import { WarehouseInboundService } from './warehouse-inbound.service.ts';
 import { WarehouseMasterService } from './warehouse-master.service.ts';
@@ -28,18 +28,43 @@ function optionalInt(val: any, fieldName: string): number | undefined {
   return parsePositiveInt(val, fieldName);
 }
 
+function paginateArray<T>(
+  rows: T[],
+  req: Request
+): { data: T[]; pagination: { total: number; limit: number; offset: number } } {
+  const total = rows.length;
+  const limit = req.query.limit !== undefined && req.query.limit !== '' ? Math.min(parsePositiveInt(req.query.limit, 'limit'), 500) : null;
+  let offset = 0;
+  if (req.query.offset !== undefined && req.query.offset !== '') {
+    const parsedOffset = Number(req.query.offset);
+    if (!Number.isInteger(parsedOffset) || parsedOffset < 0) {
+      throw badRequest('offset must be a non-negative integer');
+    }
+    offset = parsedOffset;
+  }
+  const sliced = limit !== null || offset > 0 ? rows.slice(offset, offset + (limit ?? total)) : rows;
+  return {
+    data: sliced,
+    pagination: {
+      total,
+      limit: limit ?? (total > 0 ? total : 50),
+      offset,
+    },
+  };
+}
+
 export class WarehouseController {
   // ============================================================================
   // 5.1 Warehouses, Bins, Staff & Settings
   // ============================================================================
   static async listWarehouses(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.listWarehouses(toActor(req), {
+      const rows = await WarehouseMasterService.listWarehouses(toActor(req), {
         status: req.query.status as string | undefined,
         warehouse_type: req.query.warehouse_type as string | undefined,
         search: req.query.search as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -72,8 +97,8 @@ export class WarehouseController {
   static async createWarehouse(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actor = toActor(req);
-      if (!hasGlobalWarehouseAccess(req.user!)) {
-        throw forbidden('Only System Administrator or Factory Manager may create new warehouses');
+      if (!canCreateOrManageAllWarehouses(req.user!)) {
+        throw forbidden('Only authorized administrators or Factory Manager may create new warehouses');
       }
       const data = await WarehouseMasterService.createWarehouse(req.body, actor);
       res.status(201).json({ success: true, message: 'Warehouse created successfully', data });
@@ -94,8 +119,8 @@ export class WarehouseController {
 
   static async toggleWarehouseStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!hasGlobalWarehouseAccess(req.user!)) {
-        throw forbidden('Only System Administrator or Factory Manager may change warehouse active status');
+      if (!canCreateOrManageAllWarehouses(req.user!)) {
+        throw forbidden('Only authorized administrators or Factory Manager may change warehouse active status');
       }
       const id = parsePositiveInt(req.params.id, 'warehouse_id');
       const data = await WarehouseMasterService.toggleWarehouseStatus(id, req.body.status, toActor(req));
@@ -176,6 +201,15 @@ export class WarehouseController {
     }
   }
 
+  static async listDepartmentsForWarehouseOps(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const data = await WarehouseMasterService.listAuthorizedDepartments(toActor(req));
+      res.status(200).json({ success: true, data });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   static async updateSetting(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const key = String(req.params.key || '').trim();
@@ -219,12 +253,17 @@ export class WarehouseController {
 
   static async listMaterials(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.listMaterials({
-        category_id: optionalInt(req.query.category_id, 'category_id'),
-        status: req.query.status as string | undefined,
-        search: req.query.search as string | undefined,
-      });
-      res.status(200).json({ success: true, data });
+      const rows = await WarehouseMasterService.listMaterials(
+        {
+          category_id: optionalInt(req.query.category_id, 'category_id'),
+          status: req.query.status as string | undefined,
+          search: req.query.search as string | undefined,
+          warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
+          operation: req.query.operation as string | undefined,
+        },
+        toActor(req)
+      );
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -310,7 +349,7 @@ export class WarehouseController {
   // ============================================================================
   static async getBalances(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.queryBalances(toActor(req), {
+      const rows = await WarehouseMasterService.queryBalances(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         location_id: optionalInt(req.query.location_id, 'location_id'),
         material_id: optionalInt(req.query.material_id, 'material_id'),
@@ -319,7 +358,7 @@ export class WarehouseController {
         only_available: req.query.only_available === 'true',
         only_reserved: req.query.only_reserved === 'true',
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -353,13 +392,13 @@ export class WarehouseController {
 
   static async getLots(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.queryLots(toActor(req), {
+      const rows = await WarehouseMasterService.queryLots(toActor(req), {
         material_id: optionalInt(req.query.material_id, 'material_id'),
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         qc_status: req.query.qc_status as string | undefined,
         lot_number: req.query.lot_number as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -367,16 +406,18 @@ export class WarehouseController {
 
   static async getMovements(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.queryMovements(toActor(req), {
+      const rawLimit = optionalInt(req.query.limit, 'limit');
+      const rawOffset = req.query.offset !== undefined && req.query.offset !== '' ? Number(req.query.offset) : 0;
+      const rows = await WarehouseMasterService.queryMovements(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         material_id: optionalInt(req.query.material_id, 'material_id'),
         lot_id: optionalInt(req.query.lot_id, 'lot_id'),
         movement_type: req.query.movement_type as string | undefined,
         source_document_type: req.query.source_document_type as string | undefined,
         source_document_id: optionalInt(req.query.source_document_id, 'source_document_id'),
-        limit: optionalInt(req.query.limit, 'limit'),
+        limit: rawLimit && Number.isInteger(rawOffset) && rawOffset >= 0 ? Math.min(rawLimit + rawOffset, 500) : 500,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -420,12 +461,12 @@ export class WarehouseController {
   // ============================================================================
   static async listGrns(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseInboundService.listGrns(toActor(req), {
+      const rows = await WarehouseInboundService.listGrns(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         status: req.query.status as string | undefined,
         po_reference: req.query.po_reference as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -475,11 +516,11 @@ export class WarehouseController {
   // ============================================================================
   static async listPendingQc(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseInboundService.listPendingQc(
+      const rows = await WarehouseInboundService.listPendingQc(
         optionalInt(req.query.warehouse_id, 'warehouse_id'),
         toActor(req)
       );
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -487,7 +528,7 @@ export class WarehouseController {
 
   static async listQcHistory(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseInboundService.listQcHistory(
+      const rows = await WarehouseInboundService.listQcHistory(
         {
           warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
           material_id: optionalInt(req.query.material_id, 'material_id'),
@@ -495,7 +536,7 @@ export class WarehouseController {
         },
         toActor(req)
       );
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -514,18 +555,31 @@ export class WarehouseController {
     }
   }
 
+  static async overrideQcStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const data = await WarehouseInboundService.overrideQcStatus(req.body, toActor(req));
+      res.status(200).json({
+        success: true,
+        message: `QC override ${data.inspection.inspection_number} completed`,
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   // ============================================================================
   // 5.6 Material Requisitions
   // ============================================================================
   static async listRequisitions(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseOutboundService.listRequisitions(toActor(req), {
+      const rows = await WarehouseOutboundService.listRequisitions(toActor(req), {
         status: req.query.status as string | undefined,
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         department_id: optionalInt(req.query.department_id, 'department_id'),
         production_line_id: optionalInt(req.query.production_line_id, 'production_line_id'),
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -605,11 +659,11 @@ export class WarehouseController {
   // ============================================================================
   static async listIssues(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseOutboundService.listIssues(
+      const rows = await WarehouseOutboundService.listIssues(
         toActor(req),
         optionalInt(req.query.warehouse_id, 'warehouse_id')
       );
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -639,11 +693,11 @@ export class WarehouseController {
   // ============================================================================
   static async listReturns(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseOutboundService.listReturns(
+      const rows = await WarehouseOutboundService.listReturns(
         toActor(req),
         optionalInt(req.query.warehouse_id, 'warehouse_id')
       );
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -667,11 +721,11 @@ export class WarehouseController {
   // ============================================================================
   static async listTransfers(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseControlService.listTransfers(toActor(req), {
+      const rows = await WarehouseControlService.listTransfers(toActor(req), {
         status: req.query.status as string | undefined,
         transfer_type: req.query.transfer_type as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -728,11 +782,11 @@ export class WarehouseController {
   // ============================================================================
   static async listStockCounts(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseControlService.listStockCounts(toActor(req), {
+      const rows = await WarehouseControlService.listStockCounts(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         status: req.query.status as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -792,11 +846,11 @@ export class WarehouseController {
   // ============================================================================
   static async listAdjustments(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseControlService.listAdjustments(toActor(req), {
+      const rows = await WarehouseControlService.listAdjustments(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         status: req.query.status as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -836,11 +890,11 @@ export class WarehouseController {
   // ============================================================================
   static async listReorders(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseControlService.listReorderRequests(toActor(req), {
+      const rows = await WarehouseControlService.listReorderRequests(toActor(req), {
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
         status: req.query.status as string | undefined,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }
@@ -916,12 +970,12 @@ export class WarehouseController {
   // ============================================================================
   static async listNotifications(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const data = await WarehouseMasterService.listNotifications(toActor(req), {
+      const rows = await WarehouseMasterService.listNotifications(toActor(req), {
         unread_only: req.query.unread_only === 'true',
         warehouse_id: optionalInt(req.query.warehouse_id, 'warehouse_id'),
-        limit: optionalInt(req.query.limit, 'limit'),
+        limit: 300,
       });
-      res.status(200).json({ success: true, data });
+      res.status(200).json({ success: true, ...paginateArray(rows, req) });
     } catch (err) {
       next(err);
     }

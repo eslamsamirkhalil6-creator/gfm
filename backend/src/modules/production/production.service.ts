@@ -1,5 +1,6 @@
-import { query } from '../../config/database.ts';
+import { query, withTransaction } from '../../config/database.ts';
 import { AuditService } from '../audit/audit.service.ts';
+import { notFound } from '../warehouse/warehouse.errors.ts';
 import {
   ProductionHallDto,
   ProductionLineDto,
@@ -796,80 +797,82 @@ export class ProductionService {
       throw err;
     }
 
-    const check = await query(
-      `SELECT id FROM production_workflows WHERE workflow_code = $1 OR name = $2`,
-      [workflowCode, name]
-    );
-    if (check.rowCount > 0) {
-      const err: any = new Error(`Workflow with code "${workflowCode}" or name "${name}" already exists`);
-      err.statusCode = 409;
-      throw err;
-    }
-
-    // Insert Workflow
-    const res = await query<ProductionWorkflowDto>(
-      `INSERT INTO production_workflows (name, workflow_code, description, product_category, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
-       RETURNING *`,
-      [name, workflowCode, data.description?.trim() || null, data.product_category?.trim() || null]
-    );
-    const newWorkflow = res.rows[0];
-
-    // Insert Steps in sequence
-    const insertedSteps: WorkflowStepDto[] = [];
-    for (let i = 0; i < data.steps.length; i++) {
-      const step = data.steps[i];
-      const stepOrder = i + 1; // normalize sequence
-
-      const stgCheck = await query<{ name: string; stage_code: string; stage_type: 'STANDARD' | 'QUALITY' | 'PACKING' }>(
-        `SELECT name, stage_code, stage_type FROM production_stages WHERE id = $1`,
-        [step.stage_id]
+    return withTransaction(async (txQuery) => {
+      const check = await txQuery(
+        `SELECT id FROM production_workflows WHERE workflow_code = $1 OR name = $2`,
+        [workflowCode, name]
       );
-      if (stgCheck.rowCount === 0) {
-        const err: any = new Error(`Configured stage ID #${step.stage_id} not found`);
-        err.statusCode = 404;
+      if (check.rowCount > 0) {
+        const err: any = new Error(`Workflow with code "${workflowCode}" or name "${name}" already exists`);
+        err.statusCode = 409;
+        err.code = 'DUPLICATE_WORKFLOW';
         throw err;
       }
 
-      const stg = stgCheck.rows[0];
-      const qualityGate = step.quality_gate !== undefined ? step.quality_gate : stg.stage_type === 'QUALITY';
-      const isMandatory = step.is_mandatory !== undefined ? step.is_mandatory : true;
+      const res = await txQuery<ProductionWorkflowDto>(
+        `INSERT INTO production_workflows (name, workflow_code, description, product_category, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+         RETURNING *`,
+        [name, workflowCode, data.description?.trim() || null, data.product_category?.trim() || null]
+      );
+      const newWorkflow = res.rows[0];
 
-      const stepRes = await query<{ id: number }>(
-        `INSERT INTO production_workflow_steps (workflow_id, stage_id, step_order, is_mandatory, quality_gate, notes)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id`,
-        [newWorkflow.id, step.stage_id, stepOrder, isMandatory, qualityGate, step.notes?.trim() || null]
+      const insertedSteps: WorkflowStepDto[] = [];
+      for (let i = 0; i < data.steps.length; i++) {
+        const step = data.steps[i];
+        const stepOrder = i + 1;
+
+        const stgCheck = await txQuery<{ name: string; stage_code: string; stage_type: 'STANDARD' | 'QUALITY' | 'PACKING' }>(
+          `SELECT name, stage_code, stage_type FROM production_stages WHERE id = $1`,
+          [step.stage_id]
+        );
+        if (stgCheck.rowCount === 0) {
+          throw notFound(`Configured stage ID #${step.stage_id} not found`);
+        }
+
+        const stg = stgCheck.rows[0];
+        const qualityGate = step.quality_gate !== undefined ? step.quality_gate : stg.stage_type === 'QUALITY';
+        const isMandatory = step.is_mandatory !== undefined ? step.is_mandatory : true;
+
+        const stepRes = await txQuery<{ id: number }>(
+          `INSERT INTO production_workflow_steps (workflow_id, stage_id, step_order, is_mandatory, quality_gate, notes)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id`,
+          [newWorkflow.id, step.stage_id, stepOrder, isMandatory, qualityGate, step.notes?.trim() || null]
+        );
+
+        insertedSteps.push({
+          id: stepRes.rows[0].id,
+          stage_id: step.stage_id,
+          stage_name: stg.name,
+          stage_code: stg.stage_code,
+          stage_type: stg.stage_type,
+          step_order: stepOrder,
+          is_mandatory: isMandatory,
+          quality_gate: qualityGate,
+          notes: step.notes?.trim() || null,
+        });
+      }
+
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'WORKFLOW_CREATE',
+          entityType: 'PRODUCTION_WORKFLOW',
+          entityId: newWorkflow.id,
+          details: {
+            name: newWorkflow.name,
+            code: newWorkflow.workflow_code,
+            total_steps: insertedSteps.length,
+            sequence: insertedSteps.map((s) => s.stage_name),
+          },
+          ipAddress,
+        },
+        txQuery
       );
 
-      insertedSteps.push({
-        id: stepRes.rows[0].id,
-        stage_id: step.stage_id,
-        stage_name: stg.name,
-        stage_code: stg.stage_code,
-        stage_type: stg.stage_type,
-        step_order: stepOrder,
-        is_mandatory: isMandatory,
-        quality_gate: qualityGate,
-        notes: step.notes?.trim() || null,
-      });
-    }
-
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'WORKFLOW_CREATE',
-      entityType: 'PRODUCTION_WORKFLOW',
-      entityId: newWorkflow.id,
-      details: {
-        name: newWorkflow.name,
-        code: newWorkflow.workflow_code,
-        total_steps: insertedSteps.length,
-        sequence: insertedSteps.map((s) => s.stage_name),
-      },
-      ipAddress,
+      return { ...newWorkflow, steps: insertedSteps };
     });
-
-    return { ...newWorkflow, steps: insertedSteps };
   }
 
   static async updateWorkflow(
@@ -941,64 +944,69 @@ export class ProductionService {
     actorUserId?: number | null,
     ipAddress?: string
   ): Promise<ProductionWorkflowDto> {
-    const wfCheck = await query<ProductionWorkflowDto>(`SELECT * FROM production_workflows WHERE id = $1`, [workflowId]);
-    if (wfCheck.rowCount === 0) {
-      const err: any = new Error(`Workflow #${workflowId} not found`);
-      err.statusCode = 404;
-      throw err;
-    }
-
     if (!steps || steps.length === 0) {
       const err: any = new Error('A production workflow must contain at least one stage');
       err.statusCode = 400;
+      err.code = 'VALIDATION_ERROR';
       throw err;
     }
 
-    // Capture previous steps for audit log
-    const prevStepsRes = await query<{ stage_name: string; step_order: number }>(
-      `SELECT stg.name as stage_name, s.step_order 
-       FROM production_workflow_steps s 
-       JOIN production_stages stg ON s.stage_id = stg.id 
-       WHERE s.workflow_id = $1 ORDER BY s.step_order ASC`,
-      [workflowId]
-    );
-    const prevSequence = prevStepsRes.rows.map((r) => r.stage_name);
-
-    // Replace steps safely
-    await query(`DELETE FROM production_workflow_steps WHERE workflow_id = $1`, [workflowId]);
-
-    const newSequence: string[] = [];
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const stepOrder = i + 1; // enforce 1-based sequential ordering
-
-      const stgRes = await query<{ name: string }>(`SELECT name FROM production_stages WHERE id = $1`, [step.stage_id]);
-      if (stgRes.rowCount === 0) {
-        throw new Error(`Stage ID #${step.stage_id} not found in database`);
-      }
-      newSequence.push(stgRes.rows[0].name);
-
-      await query(
-        `INSERT INTO production_workflow_steps (workflow_id, stage_id, step_order, is_mandatory, quality_gate, notes)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [workflowId, step.stage_id, stepOrder, step.is_mandatory, step.quality_gate, step.notes?.trim() || null]
+    await withTransaction(async (txQuery) => {
+      const wfCheck = await txQuery<ProductionWorkflowDto>(
+        `SELECT * FROM production_workflows WHERE id = $1 FOR UPDATE`,
+        [workflowId]
       );
-    }
+      if (wfCheck.rowCount === 0) {
+        throw notFound(`Workflow #${workflowId} not found`);
+      }
 
-    await query(`UPDATE production_workflows SET updated_at = NOW() WHERE id = $1`, [workflowId]);
+      const prevStepsRes = await txQuery<{ stage_name: string; step_order: number }>(
+        `SELECT stg.name as stage_name, s.step_order 
+         FROM production_workflow_steps s 
+         JOIN production_stages stg ON s.stage_id = stg.id 
+         WHERE s.workflow_id = $1 ORDER BY s.step_order ASC`,
+        [workflowId]
+      );
+      const prevSequence = prevStepsRes.rows.map((r) => r.stage_name);
 
-    await AuditService.log({
-      userId: actorUserId,
-      action: 'WORKFLOW_STEPS_REORDER',
-      entityType: 'PRODUCTION_WORKFLOW',
-      entityId: workflowId,
-      details: {
-        workflow: wfCheck.rows[0].name,
-        previous_sequence: prevSequence,
-        new_sequence: newSequence,
-        total_stages: newSequence.length,
-      },
-      ipAddress,
+      await txQuery(`DELETE FROM production_workflow_steps WHERE workflow_id = $1`, [workflowId]);
+
+      const newSequence: string[] = [];
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const stepOrder = i + 1;
+
+        const stgRes = await txQuery<{ name: string }>(`SELECT name FROM production_stages WHERE id = $1`, [step.stage_id]);
+        if (stgRes.rowCount === 0) {
+          throw notFound(`Stage ID #${step.stage_id} not found in database`);
+        }
+        newSequence.push(stgRes.rows[0].name);
+
+        await txQuery(
+          `INSERT INTO production_workflow_steps (workflow_id, stage_id, step_order, is_mandatory, quality_gate, notes)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [workflowId, step.stage_id, stepOrder, step.is_mandatory, step.quality_gate, step.notes?.trim() || null]
+        );
+      }
+
+      await txQuery(`UPDATE production_workflows SET updated_at = NOW() WHERE id = $1`, [workflowId]);
+
+      await AuditService.log(
+        {
+          userId: actorUserId,
+          action: 'WORKFLOW_STEPS_REORDER',
+          entityType: 'PRODUCTION_WORKFLOW',
+          entityId: workflowId,
+          details: {
+            workflow: wfCheck.rows[0].name,
+            previous_sequence: prevSequence,
+            new_sequence: newSequence,
+            total_stages: newSequence.length,
+          },
+          ipAddress,
+        },
+        txQuery
+      );
     });
 
     return this.getWorkflow(workflowId);

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { ProductionService } from './production.service.ts';
+import { parsePositiveInt } from '../warehouse/warehouse.errors.ts';
 
 function getClientIp(req: Request): string {
   const forwarded = req.headers['x-forwarded-for'] as string;
@@ -43,7 +44,7 @@ export class ProductionController {
 
   static async updateHall(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'hall_id');
       const { name, code, description } = req.body;
       const hall = await ProductionService.updateHall(
         id,
@@ -59,10 +60,10 @@ export class ProductionController {
 
   static async toggleHallStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'hall_id');
       const { status } = req.body;
       if (status !== 'active' && status !== 'inactive') {
-        res.status(400).json({ success: false, error: { message: 'Status must be "active" or "inactive"' } });
+        res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Status must be "active" or "inactive"' } });
         return;
       }
       await ProductionService.toggleHallStatus(id, status, req.user?.id, getClientIp(req));
@@ -75,7 +76,10 @@ export class ProductionController {
   // Lines
   static async listLines(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const hallId = req.query.hallId ? parseInt(req.query.hallId as string, 10) : undefined;
+      const hallId =
+        req.query.hallId !== undefined && req.query.hallId !== ''
+          ? parsePositiveInt(req.query.hallId, 'hallId')
+          : undefined;
       const lines = await ProductionService.listLines(hallId);
       res.status(200).json({ success: true, data: lines });
     } catch (err) {
@@ -86,13 +90,18 @@ export class ProductionController {
   static async createLine(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { line_number, name, hall_id, production_type, supervisor_id, capacity_per_day, description } = req.body;
+      const parsedHallId = parsePositiveInt(hall_id, 'hall_id');
+      const parsedSupId =
+        supervisor_id !== undefined && supervisor_id !== null && supervisor_id !== ''
+          ? parsePositiveInt(supervisor_id, 'supervisor_id')
+          : null;
       const line = await ProductionService.createLine(
         {
           line_number,
           name,
-          hall_id: parseInt(hall_id, 10),
+          hall_id: parsedHallId,
           production_type,
-          supervisor_id: supervisor_id ? parseInt(supervisor_id, 10) : null,
+          supervisor_id: parsedSupId,
           capacity_per_day: capacity_per_day ? parseInt(capacity_per_day, 10) : 500,
           description,
         },
@@ -107,16 +116,23 @@ export class ProductionController {
 
   static async updateLine(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'line_id');
       const { line_number, name, hall_id, production_type, supervisor_id, capacity_per_day, description, status } = req.body;
+      const parsedHallId = parsePositiveInt(hall_id, 'hall_id');
+      const parsedSupId =
+        supervisor_id !== undefined
+          ? supervisor_id !== null && supervisor_id !== ''
+            ? parsePositiveInt(supervisor_id, 'supervisor_id')
+            : null
+          : undefined;
       const line = await ProductionService.updateLine(
         id,
         {
           line_number,
           name,
-          hall_id: parseInt(hall_id, 10),
+          hall_id: parsedHallId,
           production_type,
-          supervisor_id: supervisor_id !== undefined ? (supervisor_id ? parseInt(supervisor_id, 10) : null) : undefined,
+          supervisor_id: parsedSupId,
           capacity_per_day: capacity_per_day ? parseInt(capacity_per_day, 10) : undefined,
           description,
           status,
@@ -132,10 +148,10 @@ export class ProductionController {
 
   static async toggleLineStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'line_id');
       const { status } = req.body;
       if (!['active', 'idle', 'maintenance', 'inactive'].includes(status)) {
-        res.status(400).json({ success: false, error: { message: 'Invalid line status value' } });
+        res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid line status value' } });
         return;
       }
       await ProductionService.toggleLineStatus(id, status, req.user?.id, getClientIp(req));
@@ -171,7 +187,7 @@ export class ProductionController {
 
   static async updateStage(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'stage_id');
       const { name, stage_code, description, stage_type, is_mandatory_default } = req.body;
       const stage = await ProductionService.updateStage(
         id,
@@ -187,10 +203,10 @@ export class ProductionController {
 
   static async toggleStageStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'stage_id');
       const { status } = req.body;
       if (status !== 'active' && status !== 'inactive') {
-        res.status(400).json({ success: false, error: { message: 'Status must be "active" or "inactive"' } });
+        res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Status must be "active" or "inactive"' } });
         return;
       }
       await ProductionService.toggleStageStatus(id, status, req.user?.id, getClientIp(req));
@@ -212,7 +228,7 @@ export class ProductionController {
 
   static async getWorkflow(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'workflow_id');
       const workflow = await ProductionService.getWorkflow(id);
       res.status(200).json({ success: true, data: workflow });
     } catch (err) {
@@ -236,7 +252,7 @@ export class ProductionController {
 
   static async updateWorkflow(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'workflow_id');
       const { name, workflow_code, description, product_category } = req.body;
       const workflow = await ProductionService.updateWorkflow(
         id,
@@ -252,10 +268,10 @@ export class ProductionController {
 
   static async reorderWorkflowSteps(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'workflow_id');
       const { steps } = req.body;
       if (!Array.isArray(steps)) {
-        res.status(400).json({ success: false, error: { message: 'Steps must be an array of step objects' } });
+        res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Steps must be an array of step objects' } });
         return;
       }
       const workflow = await ProductionService.reorderWorkflowSteps(id, steps, req.user?.id, getClientIp(req));
@@ -267,10 +283,10 @@ export class ProductionController {
 
   static async toggleWorkflowStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const id = parseInt(req.params.id, 10);
+      const id = parsePositiveInt(req.params.id, 'workflow_id');
       const { status } = req.body;
       if (status !== 'active' && status !== 'inactive') {
-        res.status(400).json({ success: false, error: { message: 'Status must be "active" or "inactive"' } });
+        res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Status must be "active" or "inactive"' } });
         return;
       }
       await ProductionService.toggleWorkflowStatus(id, status, req.user?.id, getClientIp(req));

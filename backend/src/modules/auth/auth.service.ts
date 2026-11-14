@@ -131,16 +131,31 @@ export class AuthService {
       ipAddress,
     });
 
-    // Fetch departments authoritatively managed by this user
-    const managedDeptsRes = await query<{ id: number }>(
-      `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
-      [user.id]
-    );
-    const managed_department_ids = managedDeptsRes.rows.map(r => r.id);
-    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+    // Derive department-manager workspace scope strictly for authorized Department Managers.
+    // Factory Managers, System Administrators, Department Planners, and generic Department Users
+    // must never receive Department Manager workspace ownership merely via manager_id or membership.
+    const isAuthorizedDeptManager =
+      roles.includes('Department Manager') &&
+      !roles.includes('Factory Manager') &&
+      !roles.includes('System Administrator') &&
+      (permissions.includes('departments:scoped:view') || permissions.includes('departments:scoped:manage'));
 
-    // Fetch warehouses authoritatively assigned to this user (active warehouse_staff or manager_id)
-    const [whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+    const hasPlanningPermission =
+      permissions.includes('planning:view') || permissions.includes('planning:manage');
+
+    const [managedDeptsRes, planningEmpDeptsRes, whStaffRes, whMgrRes, supLinesRes] = await Promise.all([
+      isAuthorizedDeptManager || hasPlanningPermission
+        ? query<{ id: number }>(
+            `SELECT id FROM departments WHERE manager_id = $1 ORDER BY id ASC`,
+            [user.id]
+          )
+        : Promise.resolve({ rows: [] as { id: number }[] }),
+      hasPlanningPermission
+        ? query<{ department_id: number }>(
+            `SELECT department_id FROM department_employees WHERE user_id = $1 ORDER BY department_id ASC`,
+            [user.id]
+          )
+        : Promise.resolve({ rows: [] as { department_id: number }[] }),
       query<{ warehouse_id: number }>(
         `SELECT warehouse_id FROM warehouse_staff
          WHERE user_id = $1 AND status = 'active'
@@ -157,6 +172,18 @@ export class AuthService {
         [user.id]
       ),
     ]);
+
+    const managed_department_ids = isAuthorizedDeptManager ? managedDeptsRes.rows.map(r => r.id) : [];
+    const primary_department_id = managed_department_ids.length > 0 ? managed_department_ids[0] : null;
+
+    const planningDeptSet = new Set<number>();
+    if (hasPlanningPermission) {
+      for (const r of planningEmpDeptsRes.rows) planningDeptSet.add(r.department_id);
+      if (isAuthorizedDeptManager) {
+        for (const r of managedDeptsRes.rows) planningDeptSet.add(r.id);
+      }
+    }
+    const planning_department_ids = Array.from(planningDeptSet).sort((a, b) => a - b);
 
     const warehouseIdSet = new Set<number>();
     for (const r of whStaffRes.rows) warehouseIdSet.add(r.warehouse_id);
@@ -178,6 +205,7 @@ export class AuthService {
         primary_department_id,
         managed_warehouse_ids,
         supervised_line_ids,
+        planning_department_ids,
       },
     };
   }

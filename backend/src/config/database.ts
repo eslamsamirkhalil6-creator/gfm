@@ -12,6 +12,7 @@ import {
 const { Pool } = pg;
 
 export type DatabaseMode = 'PostgreSQL (Live Connection)' | 'PostgreSQL (In-Memory Engine)';
+export type DatabaseEngine = 'pg' | 'pg-mem';
 
 export interface QueryResult<T = any> {
   rows: T[];
@@ -43,6 +44,45 @@ let memoryDbInstance: ReturnType<typeof newDb> | null = null;
 let memoryTxQueue: Promise<void> = Promise.resolve();
 let currentMode: DatabaseMode = 'PostgreSQL (In-Memory Engine)';
 let isInitialized = false;
+
+/**
+ * Explicit runtime database engine selector.
+ * Live PostgreSQL sets activePool on successful TCP connection; in-memory fallback uses pg-mem.
+ */
+export function getDatabaseEngine(): DatabaseEngine {
+  return activePool !== null ? 'pg' : 'pg-mem';
+}
+
+export function isPgMemEngine(): boolean {
+  return getDatabaseEngine() === 'pg-mem';
+}
+
+/**
+ * Adapter-aware integer equality predicate.
+ * - PostgreSQL ('pg'): native SARGable equality (`col = $n`) preserving B-tree index scans.
+ * - pg-mem ('pg-mem'): arithmetic guard (`col + 0 = $n`) avoiding pg-mem's indexed JOIN planner bug.
+ */
+export function sqlEqInt(column: string, paramExpr: string, engine: DatabaseEngine = getDatabaseEngine()): string {
+  return engine === 'pg' ? `${column} = ${paramExpr}` : `${column} + 0 = ${paramExpr}`;
+}
+
+/**
+ * Adapter-aware text/enum equality predicate.
+ * - PostgreSQL ('pg'): native SARGable equality (`col = $n`) preserving index scans and standard SQL NULL semantics.
+ * - pg-mem ('pg-mem'): `COALESCE(col, '') = $n` avoiding pg-mem's indexed text equality planner crash on multi-table JOINs.
+ */
+export function sqlEqText(column: string, valueExpr: string, engine: DatabaseEngine = getDatabaseEngine()): string {
+  return engine === 'pg' ? `${column} = ${valueExpr}` : `COALESCE(${column}, '') = ${valueExpr}`;
+}
+
+/**
+ * Adapter-aware integer IN predicate.
+ * - PostgreSQL ('pg'): native SARGable `col IN (...)`.
+ * - pg-mem ('pg-mem'): `col + 0 IN (...)`.
+ */
+export function sqlInInt(column: string, placeholders: string, engine: DatabaseEngine = getDatabaseEngine()): string {
+  return engine === 'pg' ? `${column} IN (${placeholders})` : `${column} + 0 IN (${placeholders})`;
+}
 
 /**
  * Initialize PostgreSQL connection or in-memory fallback with tracked migrations.

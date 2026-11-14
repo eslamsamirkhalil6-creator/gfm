@@ -19,14 +19,16 @@ All migrations and seed scripts are executed deterministically in numeric filena
 | Column | Type | Purpose |
 |---|---|---|
 | `id` | `SERIAL PRIMARY KEY` | Surrogate primary key |
-| `migration_id` | `VARCHAR(50)` | Numeric file prefix (`001`..`005`) |
+| `migration_id` | `VARCHAR(50)` | Numeric file prefix (`001`..`007`) |
 | `name` | `VARCHAR(255)` | Exact SQL file name |
 | `migration_type` | `VARCHAR(20)` | `'migration'` or `'seed'` |
 | `checksum` | `VARCHAR(64)` | SHA-256 hash of file contents |
 | `execution_ms` | `INTEGER` | Execution latency (`0` for bootstrapped legacy baseline) |
 | `applied_at` | `TIMESTAMPTZ` | UTC timestamp when recorded |
 
-Uniqueness is enforced via `UNIQUE (migration_type, name)`.
+Uniqueness is enforced via `UNIQUE (migration_type, name)`. Currently tracked scripts (**13 total entries**):
+- **Migrations (`6`):** `001_create_initial_tables.sql` .. `006_rbac_role_clarification.sql`
+- **Seeds (`7`):** `001_seed_initial_data.sql` .. `007_seed_phase07_rbac_hardening.sql`
 
 ---
 
@@ -55,11 +57,11 @@ Uniqueness is enforced via `UNIQUE (migration_type, name)`.
 
 ## 5. PostgreSQL vs `pg-mem` Portability & Compatibility Notes
 
-All SQL files (`005_create_warehouse_tables.sql`, `005_seed_warehouse_data.sql`) are written to execute identically on **PostgreSQL 14+** and **`pg-mem v3.0.14`**, respecting verified engine constraints:
+All SQL files (`005`–`007`) are written to execute identically on **PostgreSQL 14+** and **`pg-mem v3.0.14`**, respecting verified engine constraints:
 
 | Feature / Construct | PostgreSQL 14+ | `pg-mem v3.0.14` | GFMS Approach |
 |---|---|---|---|
-| Triggers / `PL/pgSQL` (`CREATE TRIGGER`, `DO $$`) | Supported | Not supported | Kept `005` DDL trigger-free; triggers/hooks installed via `onPostMigrationHook` per driver |
+| Triggers / `PL/pgSQL` (`CREATE TRIGGER`, `DO $$`) | Supported | Not supported | Kept `005`/`006` DDL trigger-free; triggers/hooks installed via `onPostMigrationHook` per driver |
 | Multi-table comma joins (`FROM a, b`) | Supported | Planner bug assigns wrong column bindings in `INSERT...SELECT` | Replaced with explicit scalar subqueries (`VALUES ((SELECT ...), (SELECT ...))`) |
 | `TRIM(varchar)` / `LENGTH(varchar)` in `CHECK` | Supported | Built-in functions missing | Used standard SQL `col <> ''` |
 | `CREATE TABLE IF NOT EXISTS` on existing table | No-op | Throws AST unread-constraint panic if table exists | Checked `tableExists(driver, 'schema_migrations')` prior to executing `DDL` |
@@ -67,19 +69,19 @@ All SQL files (`005_create_warehouse_tables.sql`, `005_seed_warehouse_data.sql`)
 | Composite FKs (`FOREIGN KEY (warehouse_id, location_id)`) | Enforced | Parsed & Enforced | Used on all location-bearing tables (`inventory_balances`, `goods_receipt_items`, etc.) |
 | `GENERATED ALWAYS AS (...) STORED` | Enforced | Parsed & dynamically recalculated | Used for `inventory_balances.qty_available` |
 | Normalized `lot_key` vs Partial Unique Index (`WHERE lot_id IS NULL`) | Partial index supported | Partial unique indexes limited | Normalized `lot_key` (`'NONE'` or lot ID string) + `CHECK` + `UNIQUE` |
-| `SELECT ... FOR UPDATE` | Real MVCC row locks | Parses & returns rows (single-process queue via `memoryTxQueue`) | Ready for Phase 04 services; concurrency row locking must be validated against live PostgreSQL |
+| `SELECT ... FOR UPDATE` | Real MVCC row locks | Parses & returns rows (single-process queue via `memoryTxQueue`) | Real MVCC locking & concurrency must be validated against live PostgreSQL 14+ |
 
 ---
 
 ## 6. Local PostgreSQL Execution & Validation Commands
 
-When PostgreSQL is running locally (see also `docs/WINDOWS_LOCAL_SETUP.md`):
+When PostgreSQL 14+ is running locally (see also `docs/WINDOWS_LOCAL_SETUP.md`):
 
 ```bash
 # 1. Run all pending migrations and seeds cleanly via Node/TS runner
 npm run db:migrate
 
-# 2. Verify tracked migrations in psql
+# 2. Verify tracked migrations in psql (expect 13 rows: 6 migrations + 7 seeds)
 psql -U postgres -d gfms_db -c "SELECT id, migration_id, migration_type, name, applied_at FROM schema_migrations ORDER BY id;"
 
 # 3. Verify WMS tables and stock_movements trigger in psql

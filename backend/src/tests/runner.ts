@@ -3,7 +3,16 @@ import path from 'path';
 import http from 'http';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { initDatabase, checkConnection, query } from '../config/database.ts';
+import {
+  initDatabase,
+  checkConnection,
+  getDatabaseEngine,
+  isPgMemEngine,
+  query,
+  sqlEqInt,
+  sqlEqText,
+  sqlInInt,
+} from '../config/database.ts';
 import {
   createConfiguredPgMemDb,
   createPgMemDriver,
@@ -15,7 +24,9 @@ import { AuthService } from '../modules/auth/auth.service.ts';
 import { UserService } from '../modules/users/user.service.ts';
 import { AuditService } from '../modules/audit/audit.service.ts';
 import { DepartmentService } from '../modules/departments/department.service.ts';
+import { ProductionService } from '../modules/production/production.service.ts';
 import { requireRole } from '../middleware/auth.middleware.ts';
+import { resetLoginRateLimiter } from '../middleware/rate-limit.middleware.ts';
 
 export interface TestResult {
   id: number;
@@ -1856,7 +1867,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
     }
 
     // 43. Fresh Database Initialization via Tracked Migrations
-    await executeTest(43, 'Fresh Database Initialization via Tracked Migrations (40 Tables)', 'WMS Schema & Migrations', async () => {
+    await executeTest(43, 'Fresh Database Initialization via Tracked Migrations (41 Tables)', 'WMS Schema & Migrations', async () => {
       const { driver, report } = await createIsolatedMigratedDb();
 
       const tablesRes = await driver.query<{ table_name: string }>(
@@ -1889,14 +1900,15 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         'reorder_requests',
         'warehouse_notifications',
         'stock_movements',
+        'department_planning_schedules',
       ];
       for (const tbl of requiredWmsTables) {
         if (!tableNames.has(tbl)) {
-          throw new Error(`Missing required Phase 03 table: ${tbl}`);
+          throw new Error(`Missing required schema table: ${tbl}`);
         }
       }
-      if (tableNames.size !== 40) {
-        throw new Error(`Expected 40 total tables (15 legacy + schema_migrations + 24 WMS), found ${tableNames.size}`);
+      if (tableNames.size !== 41) {
+        throw new Error(`Expected 41 total tables (15 legacy + schema_migrations + 24 WMS + department_planning_schedules), found ${tableNames.size}`);
       }
 
       const [migRows, wmsRoles, wmsPerms, whRows, defaultBins, settingsRows] = await Promise.all([
@@ -1904,7 +1916,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
           `SELECT migration_type, name, checksum FROM schema_migrations`
         ),
         driver.query<{ role_name: string }>(
-          `SELECT role_name FROM roles WHERE role_name IN ('Warehouse Manager','Warehouse Keeper','QC Manager','QC Inspector','Purchasing Manager','Production Manager','Finance Viewer')`
+          `SELECT role_name FROM roles WHERE role_name IN ('Warehouse Manager','Warehouse Keeper','QC Manager','QC Inspector','Purchasing Manager','Production Manager','Finance Viewer','Department Planner')`
         ),
         driver.query<{ permission_key: string }>(
           `SELECT permission_key FROM permissions WHERE permission_key LIKE 'warehouse:%' OR permission_key LIKE 'inventory:%'`
@@ -1920,17 +1932,17 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         ),
       ]);
 
-      if (report.appliedMigrations.length !== 5 || report.appliedSeeds.length !== 5) {
-        throw new Error(`Expected 5 applied migrations and 5 applied seeds, got ${report.appliedMigrations.length}/${report.appliedSeeds.length}`);
+      if (report.appliedMigrations.length !== 6 || report.appliedSeeds.length !== 7) {
+        throw new Error(`Expected 6 applied migrations and 7 applied seeds, got ${report.appliedMigrations.length}/${report.appliedSeeds.length}`);
       }
-      if (migRows.rowCount !== 10 || migRows.rows.some((r) => !r.checksum || r.checksum.length !== 64)) {
+      if (migRows.rowCount !== 13 || migRows.rows.some((r) => !r.checksum || r.checksum.length !== 64)) {
         throw new Error('schema_migrations entries missing or invalid SHA-256 checksums');
       }
-      if (wmsRoles.rowCount !== 7) {
-        throw new Error(`Expected 7 dedicated WMS roles, got ${wmsRoles.rowCount}`);
+      if (wmsRoles.rowCount !== 8) {
+        throw new Error(`Expected 7 dedicated WMS roles + Department Planner (8 total), got ${wmsRoles.rowCount}`);
       }
-      if (wmsPerms.rowCount !== 19) {
-        throw new Error(`Expected 19 WMS/inventory permissions, got ${wmsPerms.rowCount}`);
+      if (wmsPerms.rowCount !== 21) {
+        throw new Error(`Expected 21 WMS/inventory permissions, got ${wmsPerms.rowCount}`);
       }
       if (whRows.rowCount !== 4 || parseInt(String(defaultBins.rows[0]?.cnt || '0'), 10) !== 4) {
         throw new Error('Expected 4 seeded warehouses each with an auto-created DEFAULT bin');
@@ -1940,22 +1952,23 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         throw new Error('Default warehouse_settings PARAM-01 / PARAM-03 mismatch');
       }
 
-      return `Fresh init verified: ${tableNames.size} tables, 10 tracked schema_migrations rows, 7 WMS roles, 19 permissions, 4 warehouses + DEFAULT bins`;
+      return `Fresh init verified: ${tableNames.size} tables, 13 tracked schema_migrations rows, 7 WMS roles + Department Planner, 21 WMS permissions, 4 warehouses + DEFAULT bins`;
     });
 
-    // 44. Legacy 001-004 Database Upgrade to 005 (Bootstrap + Incremental Migration)
-    await executeTest(44, 'Legacy 001-004 Upgrade to 005 via Baseline Bootstrap', 'WMS Schema & Migrations', async () => {
+    // 44. Legacy 001-004 Database Upgrade to 005+ (Bootstrap + Incremental Migration)
+    await executeTest(44, 'Legacy 001-004 Upgrade via Baseline Bootstrap', 'WMS Schema & Migrations', async () => {
       const memDb = createConfiguredPgMemDb();
       const driver = createPgMemDriver(memDb);
 
       const allMigrations = loadSqlEntries(path.resolve(process.cwd(), 'database/migrations'), 'migration');
       const allSeeds = loadSqlEntries(path.resolve(process.cwd(), 'database/seeds'), 'seed');
+      const legacyIds = new Set(['001', '002', '003', '004']);
 
       // Apply only legacy 001-004 without schema_migrations table
-      for (const m of allMigrations.filter((x) => !x.name.startsWith('005_'))) {
+      for (const m of allMigrations.filter((x) => legacyIds.has(x.migrationId))) {
         await driver.execScript(m.sql);
       }
-      for (const s of allSeeds.filter((x) => !x.name.startsWith('005_'))) {
+      for (const s of allSeeds.filter((x) => legacyIds.has(x.migrationId))) {
         await driver.execScript(s.sql);
       }
 
@@ -1963,11 +1976,20 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
       if (report.bootstrappedLegacyEntries.length !== 8) {
         throw new Error(`Expected 8 bootstrapped legacy entries (001-004 migrations + seeds), got ${report.bootstrappedLegacyEntries.length}: [${report.bootstrappedLegacyEntries.join(', ')}]`);
       }
-      if (report.appliedMigrations.length !== 1 || report.appliedMigrations[0] !== '005_create_warehouse_tables.sql') {
-        throw new Error(`Expected only 005_create_warehouse_tables.sql to apply, got [${report.appliedMigrations.join(', ')}]`);
+      if (
+        report.appliedMigrations.length !== 2 ||
+        report.appliedMigrations[0] !== '005_create_warehouse_tables.sql' ||
+        report.appliedMigrations[1] !== '006_rbac_role_clarification.sql'
+      ) {
+        throw new Error(`Expected 005 and 006 migrations to apply, got [${report.appliedMigrations.join(', ')}]`);
       }
-      if (report.appliedSeeds.length !== 1 || report.appliedSeeds[0] !== '005_seed_warehouse_data.sql') {
-        throw new Error(`Expected only 005_seed_warehouse_data.sql to apply, got [${report.appliedSeeds.join(', ')}]`);
+      if (
+        report.appliedSeeds.length !== 3 ||
+        report.appliedSeeds[0] !== '005_seed_warehouse_data.sql' ||
+        report.appliedSeeds[1] !== '006_seed_rbac_role_clarification.sql' ||
+        report.appliedSeeds[2] !== '007_seed_phase07_rbac_hardening.sql'
+      ) {
+        throw new Error(`Expected 005, 006, and 007 seeds to apply, got [${report.appliedSeeds.join(', ')}]`);
       }
 
       const usersRes = await driver.query<{ cnt: string }>(`SELECT count(*) as cnt FROM users`);
@@ -1976,7 +1998,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         throw new Error('Legacy user records lost or 005 warehouses missing after upgrade');
       }
 
-      return `Upgraded legacy 001-004 DB cleanly: bootstrapped ${report.bootstrappedLegacyEntries.length} legacy entries and applied 005 schema + seed`;
+      return `Upgraded legacy 001-004 DB cleanly: bootstrapped ${report.bootstrappedLegacyEntries.length} legacy entries and applied 005-007 schemas + seeds`;
     });
 
     // 45. Migration Idempotency Check
@@ -1987,15 +2009,15 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
       if (
         secondRun.appliedMigrations.length !== 0 ||
         secondRun.appliedSeeds.length !== 0 ||
-        secondRun.skippedMigrations.length !== 5 ||
-        secondRun.skippedSeeds.length !== 5
+        secondRun.skippedMigrations.length !== 6 ||
+        secondRun.skippedSeeds.length !== 7
       ) {
         throw new Error(
           `Idempotency check failed: applied=(${secondRun.appliedMigrations.length},${secondRun.appliedSeeds.length}), skipped=(${secondRun.skippedMigrations.length},${secondRun.skippedSeeds.length})`
         );
       }
 
-      return 'Verified idempotency: second run applied 0 migrations/seeds and skipped all 5 migrations + 5 seeds';
+      return 'Verified idempotency: second run applied 0 migrations/seeds and skipped all 6 migrations + 7 seeds';
     });
 
     // 46. Migration Failure Handling & Rollback
@@ -2952,8 +2974,9 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
 
     // Shared Test Materials created cleanly in Test #61 for operational tests #62-#74
     let matFabQcId = 0; // requires_qc=true, lot=true, roll=true
-    let matNoQcId = 0;  // requires_qc=false, lot=false, roll=false
-    let matLotFifoId = 0; // requires_qc=false, lot=true, roll=false (for FIFO tests)
+    let matNoQcId = 0;  // PACKAGING: requires_qc=false, lot=false, roll=false
+    let matLotFifoId = 0; // TRIM_ACCESSORY: requires_qc=false, lot=true, roll=false (for FIFO tests)
+    let matTrimMoveId = 0; // TRIM_ACCESSORY: requires_qc=false, lot=false, roll=false (for WH-RAW<->WH-TRIM transfer/bin tests)
     let matFgId = 0;    // FINISHED_GOOD category, requires_qc=true
 
     // 61. Material Catalog, Attributes JSON (DEC-03), Reorder & QC Config
@@ -3029,13 +3052,30 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         },
       });
 
-      if (m1.status !== 201 || m2.status !== 201 || m3.status !== 201 || m4.status !== 201) {
-        throw new Error(`Material creation failed: ${m1.status}, ${m2.status}, ${m3.status}, ${m4.status}`);
+      const m5 = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: wmSession.token,
+        body: {
+          sku: `TRM-QA-STD-${wmsRunTag}`,
+          name: 'QA Standard Metal Button',
+          category_id: trmCatId,
+          base_uom: 'pcs',
+          is_lot_tracked: false,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+          min_stock_level: 5,
+          reorder_level: 10,
+        },
+      });
+
+      if (m1.status !== 201 || m2.status !== 201 || m3.status !== 201 || m4.status !== 201 || m5.status !== 201) {
+        throw new Error(`Material creation failed: ${m1.status}, ${m2.status}, ${m3.status}, ${m4.status}, ${m5.status}`);
       }
       matFabQcId = m1.data.data.id;
       matNoQcId = m2.data.data.id;
       matLotFifoId = m3.data.data.id;
       matFgId = m4.data.data.id;
+      matTrimMoveId = m5.data.data.id;
 
       // Test dedicated attributes, reorder & qc-config sub-endpoints
       const attrUpd = await apiRequest(`/warehouse/materials/${matFabQcId}/attributes`, {
@@ -3586,6 +3626,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
           warehouse_id: whRawId,
           target_location_id: rawBinId,
           material_id: matFabQcId,
+          lot_id: fabLot1Id,
           returned_qty: 11,
           return_condition: 'DAMAGED',
         },
@@ -3597,7 +3638,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
 
     // 68. Internal Bin Move & 2-Step Inter-Warehouse Transfer (IN_TRANSIT + Discrepancy)
     await executeTest(68, 'Internal Bin Move & 2-Step Inter-Warehouse Transfer (IN_TRANSIT & Discrepancy)', 'WMS Phase 04 - Transfers', async () => {
-      // Snapshot WAC of matNoQcId before transfers (must remain unchanged)
+      // Snapshot WAC of matNoQcId (PACKAGING, unit_cost=3.20, 200 units in WH-RAW rawBinId) before transfers
       const valBefore = await apiRequest('/inventory/valuation', { token: finSession.token });
       const wacBefore = Number(valBefore.data.data.materials.find((m: any) => m.id === matNoQcId).weighted_avg_cost);
 
@@ -3614,7 +3655,7 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
         throw new Error(`Internal bin move failed: ${binMove.rawText}`);
       }
 
-      // 2. Inter-Warehouse Transfer Step 1: Dispatch 30 units of matNoQcId from WH-RAW to WH-TRIM
+      // 2. Inter-Warehouse Transfer Step 1: Dispatch 30 units of matNoQcId (PACKAGING) from WH-RAW to WH-TRIM
       const dispRes = await apiRequest('/warehouse/transfers/dispatch', {
         method: 'POST',
         token: wkRawSession.token,
@@ -4069,6 +4110,2285 @@ export async function runAllTests(): Promise<TestSuiteSummary> {
       }
 
       return `Verified 0 discrepancies across full inventory_balances vs stock_movements ledger (${actions.size} distinct WMS audit event types)`;
+    });
+
+    // =========================================================================
+    // PHASE 06: RBAC Role Clarification & Dashboard Access Tests (#75 - #79)
+    // =========================================================================
+
+    // 75. Factory Manager Broad Visibility, Read-Only Planning & Non-Impersonation
+    await executeTest(75, 'Factory Manager Broad Visibility & Non-Impersonation of Department Manager', 'RBAC Role Clarification', async () => {
+      const fmLogin = await loginViaHttp('manager', 'Manager@123');
+      if (
+        (fmLogin.user.managed_department_ids && fmLogin.user.managed_department_ids.length > 0) ||
+        fmLogin.user.primary_department_id !== null
+      ) {
+        throw new Error(
+          `Factory Manager must NOT receive Department Manager workspace ownership: managed_department_ids=${JSON.stringify(fmLogin.user.managed_department_ids)}, primary=${fmLogin.user.primary_department_id}`
+        );
+      }
+
+      const [statsRes, deptsRes, dept11Res, dept12Res, planDashRes, planDept9Res, planCreateBlocked] = await Promise.all([
+        apiRequest('/departments/stats', { token: fmLogin.token }),
+        apiRequest('/departments', { token: fmLogin.token }),
+        apiRequest('/departments/11', { token: fmLogin.token }),
+        apiRequest('/departments/12', { token: fmLogin.token }),
+        apiRequest('/planning/dashboard', { token: fmLogin.token }),
+        apiRequest('/planning/departments/9', { token: fmLogin.token }),
+        apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: fmLogin.token,
+          body: {
+            department_id: 9,
+            plan_code: `PLN-FM-BLK-${wmsRunTag}`,
+            title: 'Should Be Blocked',
+            planned_start_date: '2026-06-01',
+            planned_end_date: '2026-06-07',
+          },
+        }),
+      ]);
+
+      if (statsRes.status !== 200 || statsRes.data.data.total <= 1 || deptsRes.status !== 200 || dept11Res.status !== 200 || dept12Res.status !== 200) {
+        throw new Error(
+          `Factory Manager broad department visibility failed: stats=${statsRes.status} (total=${statsRes.data?.data?.total}), depts=${deptsRes.status}, d11=${dept11Res.status}, d12=${dept12Res.status}`
+        );
+      }
+      if (planDashRes.status !== 200 || planDashRes.data.data.scope !== 'GLOBAL' || planDept9Res.status !== 200) {
+        throw new Error(`Factory Manager planning read-only oversight failed: dash=${planDashRes.status}, scope=${planDashRes.data?.data?.scope}, d9=${planDept9Res.status}`);
+      }
+      if (planCreateBlocked.status !== 403) {
+        throw new Error(`Expected 403 for Factory Manager creating planning schedule without planning:manage, got ${planCreateBlocked.status}`);
+      }
+
+      return `Verified Factory Manager managed_department_ids=[], broad dept dashboards (${statsRes.data.data.total} depts), GLOBAL read-only planning (200), and schedule mutation blocked (403)`;
+    });
+
+    // 76. System Administrator Role Boundaries (User/Role/Audit Admin, No Dept Manager or Planning Privileges)
+    await executeTest(76, 'System Administrator Boundaries & Non-Planning Separation', 'RBAC Role Clarification', async () => {
+      const saLogin = await loginViaHttp('admin', 'Admin@123');
+      if (
+        (saLogin.user.managed_department_ids && saLogin.user.managed_department_ids.length > 0) ||
+        saLogin.user.primary_department_id !== null
+      ) {
+        throw new Error(
+          `System Administrator must NOT receive Department Manager workspace ownership: ${JSON.stringify(saLogin.user.managed_department_ids)}`
+        );
+      }
+
+      const forbiddenPerms = ['departments:scoped:view', 'departments:scoped:manage', 'planning:view', 'planning:manage'];
+      for (const perm of forbiddenPerms) {
+        if (saLogin.user.permissions.includes(perm)) {
+          throw new Error(`System Administrator must not hold operational/planning permission "${perm}"`);
+        }
+      }
+
+      const [usersRes, rolesRes, auditRes, planDashRes, planCreateRes] = await Promise.all([
+        apiRequest('/users', { token: saLogin.token }),
+        apiRequest('/roles', { token: saLogin.token }),
+        apiRequest('/audit-logs', { token: saLogin.token }),
+        apiRequest('/planning/dashboard', { token: saLogin.token }),
+        apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: saLogin.token,
+          body: {
+            department_id: 9,
+            plan_code: `PLN-SA-BLK-${wmsRunTag}`,
+            title: 'Blocked Admin Plan',
+            planned_start_date: '2026-06-01',
+            planned_end_date: '2026-06-07',
+          },
+        }),
+      ]);
+
+      if (usersRes.status !== 200 || rolesRes.status !== 200 || auditRes.status !== 200) {
+        throw new Error(`System Administrator admin endpoints failed: users=${usersRes.status}, roles=${rolesRes.status}, audit=${auditRes.status}`);
+      }
+      if (planDashRes.status !== 403 || planCreateRes.status !== 403) {
+        throw new Error(`Expected 403 for System Administrator on planning endpoints, got dash=${planDashRes.status}, create=${planCreateRes.status}`);
+      }
+
+      return 'Verified System Administrator retains admin control, has managed_department_ids=[], lacks scoped/planning permissions, and gets 403 on planning endpoints';
+    });
+
+    // 77. Department Planner Strict Scope & Planning-Only Privileges
+    await executeTest(77, 'Department Planner Strict Scope, Planning-Only Perms & Out-of-Scope 403', 'RBAC Role Clarification', async () => {
+      const plannerLogin = await loginViaHttp('planner', 'Planner@123');
+      if (!plannerLogin.user.roles.includes('Department Planner') || plannerLogin.user.roles.length !== 1) {
+        throw new Error(`Expected exact role ['Department Planner'], got ${JSON.stringify(plannerLogin.user.roles)}`);
+      }
+      const expectedPlannerPerms = ['dashboard:view', 'planning:manage', 'planning:view'];
+      const actualSorted = [...plannerLogin.user.permissions].sort();
+      if (JSON.stringify(actualSorted) !== JSON.stringify(expectedPlannerPerms)) {
+        throw new Error(`Expected exact planner permissions ${JSON.stringify(expectedPlannerPerms)}, got ${JSON.stringify(actualSorted)}`);
+      }
+      if (
+        plannerLogin.user.managed_department_ids.length !== 0 ||
+        JSON.stringify(plannerLogin.user.planning_department_ids) !== JSON.stringify([9])
+      ) {
+        throw new Error(
+          `Unexpected planner scopes: managed=${JSON.stringify(plannerLogin.user.managed_department_ids)}, planning=${JSON.stringify(plannerLogin.user.planning_department_ids)}`
+        );
+      }
+
+      const [
+        planDashRes,
+        planDept9Res,
+        planDept11Block,
+        planCreateDept11Block,
+        deptsBlock,
+        deptStatsBlock,
+        dept9Block,
+        usersBlock,
+        auditBlock,
+        whBlock,
+      ] = await Promise.all([
+        apiRequest('/planning/dashboard', { token: plannerLogin.token }),
+        apiRequest('/planning/departments/9', { token: plannerLogin.token }),
+        apiRequest('/planning/departments/11', { token: plannerLogin.token }),
+        apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: plannerLogin.token,
+          body: {
+            department_id: 11,
+            plan_code: `PLN-OUT-${wmsRunTag}`,
+            title: 'Out of Scope Cutting Plan',
+            planned_start_date: '2026-06-01',
+            planned_end_date: '2026-06-07',
+          },
+        }),
+        apiRequest('/departments', { token: plannerLogin.token }),
+        apiRequest('/departments/stats', { token: plannerLogin.token }),
+        apiRequest('/departments/9', { token: plannerLogin.token }),
+        apiRequest('/users', { token: plannerLogin.token }),
+        apiRequest('/audit-logs', { token: plannerLogin.token }),
+        apiRequest('/warehouses', { token: plannerLogin.token }),
+      ]);
+
+      if (
+        planDashRes.status !== 200 ||
+        planDashRes.data.data.scope !== 'DEPARTMENT_SCOPED' ||
+        planDashRes.data.data.departments.length !== 1 ||
+        planDashRes.data.data.departments[0].id !== 9 ||
+        planDept9Res.status !== 200
+      ) {
+        throw new Error(`Planner scoped dashboard failed: ${planDashRes.rawText}`);
+      }
+      if (
+        planDept11Block.status !== 403 ||
+        planCreateDept11Block.status !== 403 ||
+        deptsBlock.status !== 403 ||
+        deptStatsBlock.status !== 403 ||
+        dept9Block.status !== 403 ||
+        usersBlock.status !== 403 ||
+        auditBlock.status !== 403 ||
+        whBlock.status !== 403
+      ) {
+        throw new Error(
+          `Planner boundary check failed: planD11=${planDept11Block.status}, createD11=${planCreateDept11Block.status}, depts=${deptsBlock.status}, stats=${deptStatsBlock.status}, dept9=${dept9Block.status}, users=${usersBlock.status}, audit=${auditBlock.status}, wh=${whBlock.status}`
+        );
+      }
+
+      // Create and update planning schedule within DEP-PLAN (#9), then clean up
+      let createdSchedId: number | null = null;
+      const viewOnlyRoleName = `PlannerViewOnly_${wmsRunTag}`;
+      const viewOnlyRoleRes = await query<{ id: number }>(
+        `INSERT INTO roles (role_name, description) VALUES ($1, 'Temp View-Only Planner Role') RETURNING id`,
+        [viewOnlyRoleName]
+      );
+      const viewOnlyRoleId = viewOnlyRoleRes.rows[0].id;
+      const viewOnlyUser = await createTempUser(`planner_ro_${wmsRunTag}`, [viewOnlyRoleId]);
+
+      try {
+        const createOk = await apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: plannerLogin.token,
+          body: {
+            department_id: 9,
+            plan_code: `PLN-OK-${wmsRunTag}`,
+            title: 'Verified PPC Capacity Run',
+            target_daily_output: 1500,
+            planned_start_date: '2026-06-01',
+            planned_end_date: '2026-06-14',
+            status: 'active',
+          },
+        });
+        if (createOk.status !== 201) {
+          throw new Error(`Planner failed creating schedule in DEP-PLAN (#9): ${createOk.rawText}`);
+        }
+        createdSchedId = createOk.data.data.id;
+
+        const statusUpd = await apiRequest(`/planning/schedules/${createdSchedId}/status`, {
+          method: 'PUT',
+          token: plannerLogin.token,
+          body: { status: 'completed' },
+        });
+        if (statusUpd.status !== 200 || statusUpd.data.data.status !== 'completed') {
+          throw new Error(`Planner failed updating schedule status: ${statusUpd.rawText}`);
+        }
+
+        // View-only planner test: planning:view without planning:manage
+        await query(
+          `INSERT INTO role_permissions (role_id, permission_id)
+           SELECT $1::int, id FROM permissions WHERE permission_key IN ('dashboard:view', 'planning:view')`,
+          [viewOnlyRoleId]
+        );
+        await query(
+          `INSERT INTO department_employees (department_id, user_id, position_title, is_primary)
+           VALUES (9, $1, 'Junior Capacity Analyst', TRUE)`,
+          [viewOnlyUser.user.id]
+        );
+        const roLogin = await loginViaHttp(viewOnlyUser.user.username, viewOnlyUser.password);
+        const roDash = await apiRequest('/planning/dashboard', { token: roLogin.token });
+        const roCreate = await apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: roLogin.token,
+          body: {
+            department_id: 9,
+            plan_code: `PLN-RO-BLK-${wmsRunTag}`,
+            title: 'Should Reject View-Only',
+            planned_start_date: '2026-06-01',
+            planned_end_date: '2026-06-07',
+          },
+        });
+        if (roDash.status !== 200 || roCreate.status !== 403) {
+          throw new Error(`View-only planner guard failed: dash=${roDash.status}, create=${roCreate.status}`);
+        }
+      } finally {
+        if (createdSchedId !== null) {
+          await query(`DELETE FROM department_planning_schedules WHERE id = $1`, [createdSchedId]);
+        }
+        await cleanupTempUser(viewOnlyUser.user.id);
+        await query(`DELETE FROM role_permissions WHERE role_id = $1`, [viewOnlyRoleId]);
+        await query(`DELETE FROM roles WHERE id = $1`, [viewOnlyRoleId]);
+      }
+
+      return 'Verified Department Planner planning-only perms, DEP-PLAN (#9) CRUD, out-of-scope 403s, and planning:view vs planning:manage enforcement';
+    });
+
+    // 78. Department Manager Scoped Stats & View-Only vs Manage Permission Enforcement
+    await executeTest(78, 'Department Manager Scoped Stats & departments:scoped:view vs manage', 'RBAC Role Clarification', async () => {
+      const dmLogin = await loginViaHttp('deptuser', 'Dept@123');
+      if (
+        !dmLogin.user.roles.includes('Department Manager') ||
+        dmLogin.user.roles.includes('Department User') ||
+        JSON.stringify(dmLogin.user.managed_department_ids) !== JSON.stringify([11])
+      ) {
+        throw new Error(`Unexpected deptuser role/scope state: roles=${JSON.stringify(dmLogin.user.roles)}, managed=${JSON.stringify(dmLogin.user.managed_department_ids)}`);
+      }
+
+      const dmStats = await apiRequest('/departments/stats', { token: dmLogin.token });
+      if (
+        dmStats.status !== 200 ||
+        dmStats.data.data.total !== 1 ||
+        dmStats.data.data.distribution.length !== 1 ||
+        dmStats.data.data.distribution[0].dept_code !== 'DEP-CUT'
+      ) {
+        throw new Error(`Department Manager stats leaked non-managed departments: ${dmStats.rawText}`);
+      }
+
+      // Test custom Department Manager role carrying ONLY departments:scoped:view (no departments:scoped:manage)
+      const viewRoleRes = await query<{ id: number }>(
+        `INSERT INTO roles (role_name, description) VALUES ($1, 'Temp Dept View Only') RETURNING id`,
+        [`DeptViewOnly_${wmsRunTag}`]
+      );
+      const viewRoleId = viewRoleRes.rows[0].id;
+      await query(
+        `INSERT INTO role_permissions (role_id, permission_id)
+         SELECT $1::int, id FROM permissions WHERE permission_key IN ('dashboard:view', 'departments:scoped:view')`,
+        [viewRoleId]
+      );
+      const viewMgr = await createTempUser(`dm_ro_${wmsRunTag}`, [viewRoleId]);
+      const empCandidate = await createTempUser(`dm_emp_${wmsRunTag}`, [roleIdByName.get('Department User')!]);
+      const tempDeptRes = await query<{ id: number }>(
+        `INSERT INTO departments (dept_code, name, description, manager_id, status)
+         VALUES ($1, $2, 'Temp RBAC View Dept', $3, 'active') RETURNING id`,
+        [`DEP-RO-${wmsRunTag}`, `Temp View Dept ${wmsRunTag}`, viewMgr.user.id]
+      );
+      const tempDeptId = tempDeptRes.rows[0].id;
+
+      try {
+        const roLogin = await loginViaHttp(viewMgr.user.username, viewMgr.password);
+        const [viewOk, editBlock, assignBlock, transferBlock, removeBlock] = await Promise.all([
+          apiRequest(`/departments/${tempDeptId}`, { token: roLogin.token }),
+          apiRequest(`/departments/${tempDeptId}`, {
+            method: 'PUT',
+            token: roLogin.token,
+            body: { description: 'Unauthorized Edit' },
+          }),
+          apiRequest(`/departments/${tempDeptId}/employees`, {
+            method: 'POST',
+            token: roLogin.token,
+            body: { user_id: empCandidate.user.id, position_title: 'Operator' },
+          }),
+          apiRequest(`/departments/${tempDeptId}/employees/transfer`, {
+            method: 'PUT',
+            token: roLogin.token,
+            body: { target_department_id: 11, user_id: empCandidate.user.id },
+          }),
+          apiRequest(`/departments/${tempDeptId}/employees/${empCandidate.user.id}`, {
+            method: 'DELETE',
+            token: roLogin.token,
+          }),
+        ]);
+
+        if (
+          viewOk.status !== 200 ||
+          editBlock.status !== 403 ||
+          assignBlock.status !== 403 ||
+          transferBlock.status !== 403 ||
+          removeBlock.status !== 403
+        ) {
+          throw new Error(
+            `Scoped view-only enforcement failed: view=${viewOk.status}, edit=${editBlock.status}, assign=${assignBlock.status}, transfer=${transferBlock.status}, remove=${removeBlock.status}`
+          );
+        }
+      } finally {
+        await query(`DELETE FROM department_employees WHERE department_id = $1`, [tempDeptId]);
+        await query(`DELETE FROM department_manager_history WHERE department_id = $1`, [tempDeptId]);
+        await query(`DELETE FROM departments WHERE id = $1`, [tempDeptId]);
+        await cleanupTempUser(viewMgr.user.id);
+        await cleanupTempUser(empCandidate.user.id);
+        await query(`DELETE FROM role_permissions WHERE role_id = $1`, [viewRoleId]);
+        await query(`DELETE FROM roles WHERE id = $1`, [viewRoleId]);
+      }
+
+      return 'Verified Department Manager scoped stats (DEP-CUT only) and strict separation of departments:scoped:view vs departments:scoped:manage';
+    });
+
+    // 79. Generic Department User Non-Privilege Enforcement (Even With Membership or DB manager_id)
+    await executeTest(79, 'Generic Department User Non-Privilege Enforcement (Dept Membership & manager_id Guard)', 'RBAC Role Clarification', async () => {
+      const staffLogin = await loginViaHttp('deptstaff', 'Staff@123');
+      if (
+        !staffLogin.user.roles.includes('Department User') ||
+        staffLogin.user.roles.length !== 1 ||
+        staffLogin.user.managed_department_ids.length !== 0 ||
+        staffLogin.user.planning_department_ids.length !== 0 ||
+        staffLogin.user.primary_department_id !== null
+      ) {
+        throw new Error(`Generic Department User unexpectedly received scope: ${JSON.stringify(staffLogin.user)}`);
+      }
+
+      // Verify seeded deptstaff IS a member of DEP-CUT (#11) in department_employees
+      const memberCheck = await query<{ cnt: string }>(
+        `SELECT count(*) as cnt FROM department_employees WHERE user_id = $1 AND department_id = 11`,
+        [staffLogin.user.id]
+      );
+      if (parseInt(String(memberCheck.rows[0]?.cnt || '0'), 10) !== 1) {
+        throw new Error('Seeded deptstaff is missing expected membership in DEP-CUT (#11)');
+      }
+
+      const [
+        deptsRes,
+        statsRes,
+        treeRes,
+        dept11Res,
+        lines11Res,
+        planDashRes,
+        plan9Res,
+        usersRes,
+        auditRes,
+      ] = await Promise.all([
+        apiRequest('/departments', { token: staffLogin.token }),
+        apiRequest('/departments/stats', { token: staffLogin.token }),
+        apiRequest('/departments/tree', { token: staffLogin.token }),
+        apiRequest('/departments/11', { token: staffLogin.token }),
+        apiRequest('/departments/11/lines', { token: staffLogin.token }),
+        apiRequest('/planning/dashboard', { token: staffLogin.token }),
+        apiRequest('/planning/departments/9', { token: staffLogin.token }),
+        apiRequest('/users', { token: staffLogin.token }),
+        apiRequest('/audit-logs', { token: staffLogin.token }),
+      ]);
+
+      const allBlocked = [deptsRes, statsRes, treeRes, dept11Res, lines11Res, planDashRes, plan9Res, usersRes, auditRes];
+      if (allBlocked.some((r) => r.status !== 403)) {
+        throw new Error(
+          `Generic Department User must receive 403 everywhere, got: [${allBlocked.map((r) => r.status).join(', ')}]`
+        );
+      }
+
+      // Edge case: even if a Department User is placed in departments.manager_id without Department Manager role/perms,
+      // they must STILL receive managed_department_ids=[] and HTTP 403!
+      const edgeStaff = await createTempUser(`du_mgr_edge_${wmsRunTag}`, [roleIdByName.get('Department User')!]);
+      const edgeDeptRes = await query<{ id: number }>(
+        `INSERT INTO departments (dept_code, name, description, manager_id, status)
+         VALUES ($1, $2, 'Edge Guard Dept', $3, 'active') RETURNING id`,
+        [`DEP-EG-${wmsRunTag}`, `Edge Dept ${wmsRunTag}`, edgeStaff.user.id]
+      );
+      const edgeDeptId = edgeDeptRes.rows[0].id;
+
+      try {
+        const edgeLogin = await loginViaHttp(edgeStaff.user.username, edgeStaff.password);
+        if (edgeLogin.user.managed_department_ids.length !== 0 || edgeLogin.user.primary_department_id !== null) {
+          throw new Error(`Department User received managed_department_ids without role/perms: ${JSON.stringify(edgeLogin.user.managed_department_ids)}`);
+        }
+
+        const [edgeStats, edgeDeptGet] = await Promise.all([
+          apiRequest('/departments/stats', { token: edgeLogin.token }),
+          apiRequest(`/departments/${edgeDeptId}`, { token: edgeLogin.token }),
+        ]);
+        if (edgeStats.status !== 403 || edgeDeptGet.status !== 403) {
+          throw new Error(`Expected 403 for unprivileged manager_id row, got stats=${edgeStats.status}, dept=${edgeDeptGet.status}`);
+        }
+      } finally {
+        await query(`DELETE FROM department_manager_history WHERE department_id = $1`, [edgeDeptId]);
+        await query(`DELETE FROM departments WHERE id = $1`, [edgeDeptId]);
+        await cleanupTempUser(edgeStaff.user.id);
+      }
+
+      return 'Verified generic Department User gets 0 management/dashboard privileges even with DEP-CUT membership or stray manager_id FK';
+    });
+
+    // ============================================================================
+    // Phase 07 Security Hardening, RBAC Scope Fixes & Operations Integration Tests
+    // ============================================================================
+
+    // 80. Auth Login Brute-Force Rate Limiting & Clear-On-Success
+    await executeTest(80, 'Login Rate Limiter Enforcement (HTTP 429 & Reset)', 'Security Hardening (Phase 07)', async () => {
+      resetLoginRateLimiter();
+      const { user: rateUser, password } = await createTempUser(`rl_${wmsRunTag}`, [roleIdByName.get('Department User')!]);
+      try {
+        for (let i = 0; i < 5; i++) {
+          const badRes = await apiRequest('/auth/login', {
+            method: 'POST',
+            body: { username: rateUser.username, password: 'WrongPassword!' },
+          });
+          if (badRes.status !== 401) {
+            throw new Error(`Expected 401 on bad attempt #${i + 1}, got ${badRes.status}`);
+          }
+        }
+
+        const lockedRes = await apiRequest('/auth/login', {
+          method: 'POST',
+          body: { username: rateUser.username, password },
+        });
+        if (lockedRes.status !== 429 || lockedRes.data?.error?.code !== 'RATE_LIMIT_EXCEEDED') {
+          throw new Error(`Expected HTTP 429 RATE_LIMIT_EXCEEDED on 6th attempt, got ${lockedRes.status}: ${lockedRes.rawText}`);
+        }
+
+        // Another legitimate user from the same IP is NOT blocked by per-account lockout
+        const otherOk = await loginViaHttp('admin', 'Admin@123');
+        if (!otherOk.token) {
+          throw new Error('Per-account lockout improperly blocked admin login');
+        }
+
+        return 'Verified 5 bad logins trigger HTTP 429 RATE_LIMIT_EXCEEDED while isolating unrelated accounts';
+      } finally {
+        resetLoginRateLimiter();
+        await cleanupTempUser(rateUser.id);
+      }
+    });
+
+    // 81. CORS Whitelist & HTTP Security Headers Hardening
+    await executeTest(81, 'CORS Strict Origin Policy & Security Headers', 'Security Hardening (Phase 07)', async () => {
+      const okFetch = await fetch(`${baseUrl}/health`, {
+        headers: { Origin: 'http://localhost:3000' },
+      });
+      if (okFetch.status !== 200) {
+        throw new Error(`Expected 200 for allowed Origin http://localhost:3000, got ${okFetch.status}`);
+      }
+      if (
+        okFetch.headers.get('x-content-type-options') !== 'nosniff' ||
+        okFetch.headers.get('x-frame-options') !== 'SAMEORIGIN' ||
+        okFetch.headers.get('x-powered-by') !== null
+      ) {
+        throw new Error('Missing expected security headers (nosniff / SAMEORIGIN / disabled x-powered-by)');
+      }
+
+      const evilFetch = await fetch(`${baseUrl}/health`, {
+        headers: { Origin: 'https://evil-attacker.example.com' },
+      });
+      const evilBody: any = await evilFetch.json().catch(() => null);
+      if (evilFetch.status !== 403 || evilBody?.error?.code !== 'CORS_FORBIDDEN') {
+        throw new Error(`Expected 403 CORS_FORBIDDEN for unauthorized origin, got ${evilFetch.status}: ${JSON.stringify(evilBody)}`);
+      }
+
+      return 'Verified strict CORS whitelist (HTTP 403 CORS_FORBIDDEN) and hardened HTTP response security headers';
+    });
+
+    // 82. Standardized Route ID Validation & Workflow Reorder Transaction Rollback
+    await executeTest(82, 'Positive Int Route Validation & Transaction Rollback (Production)', 'API Hardening (Phase 07)', async () => {
+      const [badDept, badUser, badHall] = await Promise.all([
+        apiRequest('/departments/not-a-number', { token: adminSession.token }),
+        apiRequest('/users/0/status', { method: 'PUT', token: adminSession.token, body: { isActive: false } }),
+        apiRequest('/production/halls/abc', { method: 'PUT', token: adminSession.token, body: { name: 'X' } }),
+      ]);
+
+      for (const [label, r] of [
+        ['departments/not-a-number', badDept],
+        ['users/0/status', badUser],
+        ['production/halls/abc', badHall],
+      ] as const) {
+        if (r.status !== 400 || r.data?.success !== false || !r.data?.error?.code || !r.data?.error?.message) {
+          throw new Error(`Expected standardized 400 error on ${label}, got ${r.status}: ${r.rawText}`);
+        }
+      }
+
+      // Transaction rollback verification on ProductionService.reorderWorkflowSteps
+      const wfRes = await query<{ id: number }>(`SELECT id FROM production_workflows ORDER BY id ASC LIMIT 1`);
+      const wfId = wfRes.rows[0].id;
+      const beforeSteps = await query<{ stage_id: number; step_order: number }>(
+        `SELECT stage_id, step_order FROM production_workflow_steps WHERE workflow_id = $1 ORDER BY step_order ASC`,
+        [wfId]
+      );
+      if (beforeSteps.rowCount === 0) {
+        throw new Error('Expected seeded production workflow steps for rollback test');
+      }
+
+      let failedAsExpected = false;
+      try {
+        await ProductionService.reorderWorkflowSteps(
+          wfId,
+          [
+            { stage_id: beforeSteps.rows[0].stage_id, is_mandatory: true, quality_gate: false },
+            { stage_id: 9999999, is_mandatory: true, quality_gate: false },
+          ],
+          adminSession.user.id,
+          '127.0.0.1'
+        );
+      } catch (err: any) {
+        failedAsExpected = err.statusCode === 404;
+      }
+      if (!failedAsExpected) {
+        throw new Error('Expected 404 failure when reordering with non-existent stage_id');
+      }
+
+      const afterSteps = await query<{ stage_id: number; step_order: number }>(
+        `SELECT stage_id, step_order FROM production_workflow_steps WHERE workflow_id = $1 ORDER BY step_order ASC`,
+        [wfId]
+      );
+      if (JSON.stringify(beforeSteps.rows) !== JSON.stringify(afterSteps.rows)) {
+        throw new Error('Workflow steps were not preserved after failed reorder transaction!');
+      }
+
+      return `Verified standardized 400 ID validation across Users/Depts/Production and atomic rollback on workflow #${wfId}`;
+    });
+
+    // 83. Self-Deactivation & Last Active System Administrator Protection
+    await executeTest(83, 'Admin Self-Deactivation & Last-Admin Protection', 'Security Hardening (Phase 07)', async () => {
+      // 1) Self-deactivation blocked with 400 SELF_DEACTIVATION_FORBIDDEN
+      const selfRes = await apiRequest(`/users/${adminSession.user.id}/status`, {
+        method: 'PUT',
+        token: adminSession.token,
+        body: { is_active: false },
+      });
+      if (selfRes.status !== 400 || selfRes.data?.error?.code !== 'SELF_DEACTIVATION_FORBIDDEN') {
+        throw new Error(`Expected 400 SELF_DEACTIVATION_FORBIDDEN, got ${selfRes.status}: ${selfRes.rawText}`);
+      }
+
+      // 2) Last active System Administrator protection (409 LAST_ADMIN_PROTECTION)
+      // Temporarily ensure only 1 active admin exists, or test direct service check on admin when no other active admins exist
+      const adminRoleId = roleIdByName.get('System Administrator')!;
+      const { user: secondAdmin, password: secondPass } = await createTempUser(`adm2_${wmsRunTag}`, [adminRoleId]);
+      try {
+        const secondLogin = await loginViaHttp(secondAdmin.username, secondPass);
+        // Deactivate any extra active admins other than secondAdmin? Wait: keep test clean — deactivate primary admin ONLY if we immediately restore, OR verify service allows deactivating secondAdmin then blocks stripping/deactivating when count===1.
+        // Safely: temporarily mark admin (#1) inactive via SQL inside try/finally so secondAdmin is the sole active admin, then try to strip secondAdmin's roles via another route or deactivate admin #1 vs #2:
+        await query(`UPDATE users SET is_active = FALSE WHERE id = $1`, [adminSession.user.id]);
+        const stripSelfRoleRes = await apiRequest(`/users/${secondAdmin.id}/roles`, {
+          method: 'PUT',
+          token: secondLogin.token,
+          body: { roleIds: [roleIdByName.get('Factory Manager')!] },
+        });
+        if (stripSelfRoleRes.status !== 409 || stripSelfRoleRes.data?.error?.code !== 'LAST_ADMIN_PROTECTION') {
+          throw new Error(`Expected 409 LAST_ADMIN_PROTECTION stripping sole active admin role, got ${stripSelfRoleRes.status}: ${stripSelfRoleRes.rawText}`);
+        }
+
+        // Also check UserService.updateUserStatus directly from another actor context
+        let serviceBlockedLastAdmin = false;
+        try {
+          await UserService.updateUserStatus(secondAdmin.id, false, adminSession.user.id, '127.0.0.1');
+        } catch (err: any) {
+          serviceBlockedLastAdmin = err.statusCode === 409 && err.code === 'LAST_ADMIN_PROTECTION';
+        }
+        if (!serviceBlockedLastAdmin) {
+          throw new Error('UserService.updateUserStatus failed to enforce LAST_ADMIN_PROTECTION');
+        }
+      } finally {
+        await query(`UPDATE users SET is_active = TRUE WHERE id = $1`, [adminSession.user.id]);
+        await cleanupTempUser(secondAdmin.id);
+      }
+
+      return 'Verified 400 SELF_DEACTIVATION_FORBIDDEN and 409 LAST_ADMIN_PROTECTION on both status and role updates';
+    });
+
+    // 84. Notification IDOR Prevention & Transactional Audit Trail
+    await executeTest(84, 'Notification IDOR Prevention (PUT /warehouse/notifications/:id/read)', 'WMS Security (Phase 07)', async () => {
+      const [whMgrSession, qcInspSession] = await Promise.all([
+        loginViaHttp('whmanager', 'Warehouse@123'),
+        loginViaHttp('qcinspector', 'Qc@123'),
+      ]);
+
+      // Seed a notification explicitly scoped to Warehouse Manager in WH-RAW (#1)
+      const insRes = await query<{ id: number }>(
+        `INSERT INTO warehouse_notifications (
+           target_role_name, warehouse_id, notification_type, severity, title, message, entity_type, entity_id
+         ) VALUES ('Warehouse Manager', 1, 'GENERAL', 'INFO', 'Phase07 IDOR Test Alert', 'WH-RAW only', 'WAREHOUSE', 1)
+         RETURNING id`
+      );
+      const notifId = insRes.rows[0].id;
+
+      try {
+        // qcinspector is QC Inspector (even though assigned to WH-RAW), NOT Warehouse Manager -> MUST get 403!
+        const wrongRoleRes = await apiRequest(`/warehouse/notifications/${notifId}/read`, {
+          method: 'PUT',
+          token: qcInspSession.token,
+        });
+        if (wrongRoleRes.status !== 403) {
+          throw new Error(`Expected 403 IDOR block for wrong role qcinspector, got ${wrongRoleRes.status}`);
+        }
+
+        // Seed a notification scoped to WH-FG (#4) for Warehouse Manager; whmanager is only assigned WH-RAW (#1) & WH-TRIM (#2) -> MUST get 403!
+        const whFgNotifRes = await query<{ id: number }>(
+          `INSERT INTO warehouse_notifications (
+             target_role_name, warehouse_id, notification_type, severity, title, message, entity_type, entity_id
+           ) VALUES ('Warehouse Manager', 4, 'GENERAL', 'INFO', 'WH-FG Scoped Alert', 'WH-FG only', 'WAREHOUSE', 4)
+           RETURNING id`
+        );
+        const whFgNotifId = whFgNotifRes.rows[0].id;
+        try {
+          const wrongWhRes = await apiRequest(`/warehouse/notifications/${whFgNotifId}/read`, {
+            method: 'PUT',
+            token: whMgrSession.token,
+          });
+          if (wrongWhRes.status !== 403) {
+            throw new Error(`Expected 403 warehouse-scope IDOR block for whmanager on WH-FG alert, got ${wrongWhRes.status}`);
+          }
+        } finally {
+          await query(`DELETE FROM warehouse_notifications WHERE id = $1`, [whFgNotifId]);
+        }
+
+        // Authorized whmanager marks WH-RAW alert read -> 200 + audit log
+        const okRes = await apiRequest(`/warehouse/notifications/${notifId}/read`, {
+          method: 'PUT',
+          token: whMgrSession.token,
+        });
+        if (okRes.status !== 200 || okRes.data?.data?.is_read !== true) {
+          throw new Error(`Expected 200 marking own scoped notification read, got ${okRes.status}: ${okRes.rawText}`);
+        }
+
+        const auditCheck = await query<{ cnt: string }>(
+          `SELECT count(*) as cnt FROM audit_logs WHERE action = 'WMS_NOTIFICATION_READ' AND entity_id = $1`,
+          [notifId]
+        );
+        if (parseInt(String(auditCheck.rows[0]?.cnt || '0'), 10) < 1) {
+          throw new Error('Expected WMS_NOTIFICATION_READ audit log entry');
+        }
+      } finally {
+        await query(`DELETE FROM warehouse_notifications WHERE id = $1`, [notifId]);
+      }
+
+      return 'Verified notification IDOR rejection across role & warehouse scope (403) and authorized read + audit logging (200)';
+    });
+
+    // 85. Global Warehouse Create/Status Privilege Boundary & Scope Isolation
+    await executeTest(85, 'Warehouse Create/Status Authority & Scope Enforcement', 'WMS RBAC (Phase 07)', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+
+      // Warehouse Manager cannot create a new global warehouse or toggle status globally -> 403
+      const [createBlocked, statusBlocked, outOfScopeGet] = await Promise.all([
+        apiRequest('/warehouses', {
+          method: 'POST',
+          token: whMgrSession.token,
+          body: { warehouse_code: `WH-BLK-${wmsRunTag}`, name: 'Blocked WH', warehouse_type: 'GENERAL' },
+        }),
+        apiRequest('/warehouses/1/status', {
+          method: 'PUT',
+          token: whMgrSession.token,
+          body: { status: 'inactive' },
+        }),
+        apiRequest('/warehouses/4', { token: whMgrSession.token }),
+      ]);
+
+      if (createBlocked.status !== 403 || statusBlocked.status !== 403 || outOfScopeGet.status !== 403) {
+        throw new Error(
+          `Expected 403s for whmanager create/status/out-of-scope: create=${createBlocked.status}, status=${statusBlocked.status}, wh4=${outOfScopeGet.status}`
+        );
+      }
+
+      // Assigned warehouse WH-RAW (#1) read succeeds (200)
+      const assignedOk = await apiRequest('/warehouses/1', { token: whMgrSession.token });
+      if (assignedOk.status !== 200) {
+        throw new Error(`Expected 200 reading assigned WH-RAW (#1), got ${assignedOk.status}`);
+      }
+
+      return 'Verified Warehouse Manager is bounded to WH-RAW/WH-TRIM (WH-FG=403) and blocked from creating/deactivating warehouses (403)';
+    });
+
+    // 86. QC Inspector Scope vs QC Manager Senior Override
+    await executeTest(86, 'QC Inspector Warehouse Scope vs QC Manager Senior Override', 'WMS RBAC & QC (Phase 07)', async () => {
+      const [qcMgrSession, qcInspSession, whMgrSession] = await Promise.all([
+        loginViaHttp('qcmanager', 'QcMgr@123'),
+        loginViaHttp('qcinspector', 'Qc@123'),
+        loginViaHttp('whmanager', 'Warehouse@123'),
+      ]);
+
+      // Create a posted GRN in WH-RAW (#1) with a QC-required fabric item so stock sits in QUARANTINE
+      const fabMat = (await query<{ id: number }>(`SELECT id FROM materials WHERE sku = 'FAB-COT-220-NVY'`)).rows[0];
+      const trimMat = (await query<{ id: number }>(`SELECT id FROM materials WHERE sku = 'TRM-ZIP-18-BLK'`)).rows[0];
+      const locRaw = (await query<{ id: number }>(`SELECT id FROM warehouse_locations WHERE warehouse_id = 1 AND is_default = TRUE`)).rows[0];
+      const locTrim = (await query<{ id: number }>(`SELECT id FROM warehouse_locations WHERE warehouse_id = 2 AND is_default = TRUE`)).rows[0];
+
+      const grnRawRes = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { warehouse_id: 1, supplier_name: 'Phase07 QC Mill', po_reference: `PO-QC-${wmsRunTag}` },
+      });
+      if (grnRawRes.status !== 201) {
+        throw new Error(`Setup GRN WH-RAW failed (${grnRawRes.status}): ${grnRawRes.rawText}`);
+      }
+      const grnRawId = grnRawRes.data.data.grn.id;
+      const rawItemAddRes = await apiRequest(`/warehouse/grns/${grnRawId}/items`, {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          material_id: fabMat.id,
+          target_location_id: locRaw.id,
+          received_qty: 20,
+          pending_inspection_qty: 20,
+          unit_cost: 8.5,
+          lot_number: `LOT-P07-${wmsRunTag}`,
+          roll_number: 'R-01',
+        },
+      });
+      if (rawItemAddRes.status !== 201) {
+        throw new Error(`Setup GRN item WH-RAW failed (${rawItemAddRes.status}): ${rawItemAddRes.rawText}`);
+      }
+      const postRawRes = await apiRequest(`/warehouse/grns/${grnRawId}/post`, { method: 'POST', token: whMgrSession.token });
+      if (postRawRes.status !== 200) {
+        throw new Error(`Post GRN WH-RAW failed (${postRawRes.status}): ${postRawRes.rawText}`);
+      }
+
+      // Also create & post a GRN in WH-TRIM (#2) to test qcinspector warehouse scope boundary
+      const grnTrimRes = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { warehouse_id: 2, supplier_name: 'Phase07 Trim Vendor', po_reference: `PO-TRM-${wmsRunTag}` },
+      });
+      if (grnTrimRes.status !== 201) {
+        throw new Error(`Setup GRN WH-TRIM failed (${grnTrimRes.status}): ${grnTrimRes.rawText}`);
+      }
+      const grnTrimId = grnTrimRes.data.data.grn.id;
+      const trimItemRes = await apiRequest(`/warehouse/grns/${grnTrimId}/items`, {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          material_id: trimMat.id,
+          target_location_id: locTrim.id,
+          received_qty: 100,
+          pending_inspection_qty: 100,
+          lot_number: `LOT-TRM-${wmsRunTag}`,
+          unit_cost: 0.25,
+        },
+      });
+      if (trimItemRes.status !== 201) {
+        throw new Error(`Setup GRN item WH-TRIM failed (${trimItemRes.status}): ${trimItemRes.rawText}`);
+      }
+      const trimItemId = trimItemRes.data.data.id;
+      const postTrimRes = await apiRequest(`/warehouse/grns/${grnTrimId}/post`, { method: 'POST', token: whMgrSession.token });
+      if (postTrimRes.status !== 200) {
+        throw new Error(`Post GRN WH-TRIM failed (${postTrimRes.status}): ${postTrimRes.rawText}`);
+      }
+
+      // Ensure trim material requires QC if needed, or even simpler: qcinspector trying inspect on trimItemId must fail with 403 (warehouse scope)!
+      const crossWhInspect = await apiRequest('/warehouse/qc/inspect', {
+        method: 'POST',
+        token: qcInspSession.token,
+        body: { grn_item_id: trimItemId, passed_qty: 10, rejected_qty: 0, damaged_qty: 0 },
+      });
+      if (crossWhInspect.status !== 403) {
+        throw new Error(`Expected 403 when WH-RAW qcinspector inspects WH-TRIM item, got ${crossWhInspect.status}`);
+      }
+
+      // QC Inspector CANNOT call /warehouse/qc/override -> 403
+      const rawItemRes = await query<{ id: number; lot_id: number }>(
+        `SELECT id, lot_id FROM goods_receipt_items WHERE grn_id = $1 LIMIT 1`,
+        [grnRawId]
+      );
+      const rawItem = rawItemRes.rows[0];
+      const inspOverrideBlock = await apiRequest('/warehouse/qc/override', {
+        method: 'POST',
+        token: qcInspSession.token,
+        body: {
+          warehouse_id: 1,
+          material_id: fabMat.id,
+          lot_id: rawItem.lot_id,
+          from_stock_status: 'QUARANTINE',
+          to_stock_status: 'AVAILABLE',
+          quantity: 5,
+          reason: 'Inspector should not override',
+        },
+      });
+      if (inspOverrideBlock.status !== 403) {
+        throw new Error(`Expected 403 for qcinspector on /warehouse/qc/override, got ${inspOverrideBlock.status}`);
+      }
+
+      // QC Manager CAN execute senior override QUARANTINE -> AVAILABLE (200)
+      const mgrOverrideOk = await apiRequest('/warehouse/qc/override', {
+        method: 'POST',
+        token: qcMgrSession.token,
+        body: {
+          warehouse_id: 1,
+          location_id: locRaw.id,
+          material_id: fabMat.id,
+          lot_id: rawItem.lot_id,
+          from_stock_status: 'QUARANTINE',
+          to_stock_status: 'AVAILABLE',
+          quantity: 5,
+          reason: 'Lab shade variance within buyer 3% tolerance approval',
+        },
+      });
+      if (mgrOverrideOk.status !== 200 || !mgrOverrideOk.data?.data?.inspection?.inspection_number?.startsWith('QCO-')) {
+        throw new Error(`Expected 200 QC override for qcmanager, got ${mgrOverrideOk.status}: ${mgrOverrideOk.rawText}`);
+      }
+
+      return 'Verified qcinspector bounded to WH-RAW (WH-TRIM=403, override=403) and qcmanager senior override QCO traceability (200)';
+    });
+
+    // 87. Production Manager Read Scope & Department Manager Scoped Planning View
+    await executeTest(87, 'Production Manager & Department Manager Corrected RBAC Scopes', 'RBAC Hardening (Phase 07)', async () => {
+      const [prodMgrSession, deptMgrRes] = await Promise.all([
+        loginViaHttp('prodmanager', 'ProdMgr@123'),
+        loginViaHttp('deptuser', 'Dept@123'),
+      ]);
+
+      // Production Manager can view production halls/lines/workflows (200) but CANNOT mutate setup (403)
+      const [prodHalls, prodLines, prodCreateBlock, prodWfBlock] = await Promise.all([
+        apiRequest('/production/halls', { token: prodMgrSession.token }),
+        apiRequest('/production/lines', { token: prodMgrSession.token }),
+        apiRequest('/production/halls', {
+          method: 'POST',
+          token: prodMgrSession.token,
+          body: { name: 'Blocked Hall', code: `H-BLK-${wmsRunTag}` },
+        }),
+        apiRequest('/production/workflows/1', {
+          method: 'PUT',
+          token: prodMgrSession.token,
+          body: { name: 'Blocked Edit' },
+        }),
+      ]);
+      if (prodHalls.status !== 200 || prodLines.status !== 200 || prodCreateBlock.status !== 403 || prodWfBlock.status !== 403) {
+        throw new Error(
+          `Production Manager scope mismatch: halls=${prodHalls.status}, lines=${prodLines.status}, create=${prodCreateBlock.status}, wf=${prodWfBlock.status}`
+        );
+      }
+
+      // Department Manager (deptuser -> DEP-CUT #11) now holds planning:view: can read DEP-CUT planning (200) but blocked from DEP-PLAN (#9) and mutations (403)
+      const [planDash, planCut, planOtherBlock, planCreateBlock] = await Promise.all([
+        apiRequest('/planning/dashboard', { token: deptMgrRes.token }),
+        apiRequest('/planning/departments/11', { token: deptMgrRes.token }),
+        apiRequest('/planning/departments/9', { token: deptMgrRes.token }),
+        apiRequest('/planning/schedules', {
+          method: 'POST',
+          token: deptMgrRes.token,
+          body: {
+            department_id: 11,
+            plan_code: `PLN-BLK-${wmsRunTag}`,
+            title: 'Should Be Read-Only',
+            planned_start_date: '2026-07-01',
+            planned_end_date: '2026-07-05',
+          },
+        }),
+      ]);
+      if (planDash.status !== 200 || planCut.status !== 200 || planOtherBlock.status !== 403 || planCreateBlock.status !== 403) {
+        throw new Error(
+          `Department Manager planning:view scope mismatch: dash=${planDash.status}, cut=${planCut.status}, dep9=${planOtherBlock.status}, create=${planCreateBlock.status}`
+        );
+      }
+
+      return 'Verified Production Manager read-only production scope and Department Manager scoped planning:view (DEP-CUT=200, DEP-PLAN=403, mutate=403)';
+    });
+
+    // 88. Phase 07 Seeded UAT Accounts Login & Role Verification
+    await executeTest(88, 'Phase 07 Operational UAT Accounts & Warehouse Staff Assignments', 'RBAC Hardening (Phase 07)', async () => {
+      const uatExpectations: Array<{ u: string; p: string; role: string; whIds?: number[] }> = [
+        { u: 'whmanager', p: 'Warehouse@123', role: 'Warehouse Manager', whIds: [1, 2] },
+        { u: 'whkeeper', p: 'Keeper@123', role: 'Warehouse Keeper', whIds: [1] },
+        { u: 'qcmanager', p: 'QcMgr@123', role: 'QC Manager' },
+        { u: 'qcinspector', p: 'Qc@123', role: 'QC Inspector', whIds: [1] },
+        { u: 'purchasing', p: 'Purch@123', role: 'Purchasing Manager' },
+        { u: 'prodmanager', p: 'ProdMgr@123', role: 'Production Manager' },
+        { u: 'finance', p: 'Finance@123', role: 'Finance Viewer' },
+      ];
+
+      for (const acc of uatExpectations) {
+        const s = await loginViaHttp(acc.u, acc.p);
+        if (!s.user.roles.includes(acc.role)) {
+          throw new Error(`UAT user ${acc.u} missing expected role ${acc.role}: ${JSON.stringify(s.user.roles)}`);
+        }
+        if (acc.whIds) {
+          const sortedActual = [...(s.user.managed_warehouse_ids || [])].sort((a: number, b: number) => a - b);
+          if (JSON.stringify(sortedActual) !== JSON.stringify(acc.whIds)) {
+            throw new Error(`UAT user ${acc.u} warehouse scope mismatch: expected ${JSON.stringify(acc.whIds)}, got ${JSON.stringify(sortedActual)}`);
+          }
+        }
+      }
+
+      return 'Verified all 7 Phase 07 operational UAT accounts authenticate via PostgreSQL with accurate roles and warehouse scopes';
+    });
+
+    // 89. WMS List Endpoints Pagination Metadata & Backward Compatibility
+    await executeTest(89, 'WMS List Pagination Metadata & Backward-Compatible Shapes', 'API Contract (Phase 07)', async () => {
+      const [whPaged, whFull, matPaged, mvPaged, balPaged] = await Promise.all([
+        apiRequest('/warehouses?limit=2&offset=1', { token: adminSession.token }),
+        apiRequest('/warehouses', { token: adminSession.token }),
+        apiRequest('/warehouse/materials?limit=2&offset=0', { token: adminSession.token }),
+        apiRequest('/inventory/movements?limit=3&offset=0', { token: adminSession.token }),
+        apiRequest('/inventory/balances?limit=2&offset=0', { token: adminSession.token }),
+      ]);
+
+      for (const [label, r] of [
+        ['warehouses paged', whPaged],
+        ['warehouses full', whFull],
+        ['materials paged', matPaged],
+        ['movements paged', mvPaged],
+        ['balances paged', balPaged],
+      ] as const) {
+        if (r.status !== 200 || !Array.isArray(r.data?.data) || !r.data?.pagination) {
+          throw new Error(`Missing paginated response shape on ${label}: ${r.status} / ${r.rawText}`);
+        }
+      }
+
+      if (whPaged.data.data.length !== 2 || whPaged.data.pagination.offset !== 1 || whPaged.data.pagination.total < 4) {
+        throw new Error(`Unexpected /warehouses?limit=2&offset=1 result: ${whPaged.rawText}`);
+      }
+      if (whFull.data.data.length < 4) {
+        throw new Error(`Unbounded /warehouses should return all >= 4 rows, got ${whFull.data.data.length}`);
+      }
+      if (matPaged.data.data.length > 2 || mvPaged.data.data.length > 3 || balPaged.data.data.length > 2) {
+        throw new Error('Pagination limit bound exceeded on materials/movements/balances');
+      }
+
+      return `Verified pagination metadata ({ total, limit, offset }) across warehouses, materials, balances, and stock movements`;
+    });
+
+    // 90. Material Catalog Join-Filter Fix & Warehouse Scope / Operation Compatibility
+    await executeTest(90, 'Material Catalog pg-mem Join Fix, Warehouse Compatibility & RBAC Scope', 'WMS Returns & Transfers Bugfix', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+
+      // Base active catalog list (previously returned 500 in pg-mem due to indexed m.status equality on joined query)
+      const allActiveRes = await apiRequest('/warehouse/materials?status=active&limit=500&offset=0', {
+        token: whMgrSession.token,
+      });
+      if (allActiveRes.status !== 200 || !Array.isArray(allActiveRes.data?.data) || !allActiveRes.data?.pagination) {
+        throw new Error(`Expected 200 paginated active materials list, got ${allActiveRes.status}: ${allActiveRes.rawText}`);
+      }
+      const allSkus = new Set((allActiveRes.data.data as any[]).map((m) => m.sku));
+      if (!allSkus.has('FAB-COT-220-NVY') || !allSkus.has('TRM-ZIP-18-BLK') || !allSkus.has('PKG-CTN-EXP-L')) {
+        throw new Error(`Missing seeded active SKUs in /warehouse/materials?status=active: ${JSON.stringify([...allSkus])}`);
+      }
+
+      // WH-RAW (FABRIC) RETURN mode -> includes FABRIC, TRIM_ACCESSORY, PACKAGING (excludes FINISHED_GOOD)
+      const rawReturnRes = await apiRequest(
+        `/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=RETURN&limit=500&offset=0`,
+        { token: whMgrSession.token }
+      );
+      if (rawReturnRes.status !== 200) {
+        throw new Error(`Expected 200 for WH-RAW RETURN materials, got ${rawReturnRes.status}: ${rawReturnRes.rawText}`);
+      }
+      const rawSkus = new Set((rawReturnRes.data.data as any[]).map((m) => m.sku));
+      if (!rawSkus.has('FAB-COT-220-NVY') || !rawSkus.has('TRM-ZIP-18-BLK') || !rawSkus.has('PKG-CTN-EXP-L') || rawSkus.has(`FG-SHIRT-${wmsRunTag}`)) {
+        throw new Error(`Unexpected WH-RAW compatible SKUs: ${JSON.stringify([...rawSkus])}`);
+      }
+
+      // WH-TRIM (TRIMS_ACCESSORIES) RETURN mode -> includes TRIM_ACCESSORY & PACKAGING, excludes FABRIC & FINISHED_GOOD
+      const trimReturnRes = await apiRequest(
+        `/warehouse/materials?status=active&warehouse_id=${whTrimId}&operation=RETURN&limit=500&offset=0`,
+        { token: whMgrSession.token }
+      );
+      if (trimReturnRes.status !== 200) {
+        throw new Error(`Expected 200 for WH-TRIM RETURN materials, got ${trimReturnRes.status}: ${trimReturnRes.rawText}`);
+      }
+      const trimSkus = new Set((trimReturnRes.data.data as any[]).map((m) => m.sku));
+      if (!trimSkus.has('TRM-ZIP-18-BLK') || !trimSkus.has('PKG-CTN-EXP-L') || trimSkus.has('FAB-COT-220-NVY') || trimSkus.has(`FG-SHIRT-${wmsRunTag}`)) {
+        throw new Error(`Unexpected WH-TRIM compatible SKUs: ${JSON.stringify([...trimSkus])}`);
+      }
+
+      // Unauthorized warehouse WH-FG (#4) -> MUST deny 403 for whmanager
+      const unauthWhRes = await apiRequest(
+        `/warehouse/materials?status=active&warehouse_id=${whFgId}&operation=RETURN`,
+        { token: whMgrSession.token }
+      );
+      if (unauthWhRes.status !== 403) {
+        throw new Error(`Expected 403 for whmanager querying unassigned WH-FG, got ${unauthWhRes.status}`);
+      }
+
+      return 'Verified /warehouse/materials?status=active 200 fix, WH-RAW vs WH-TRIM compatibility filtering, and 403 warehouse scope guard';
+    });
+
+    // 91. Inactive Material Exclusion & Return/Transfer Mutation Blocking
+    await executeTest(91, 'Inactive Material Exclusion & Return/Transfer Mutation Guard', 'WMS Returns & Transfers Bugfix', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrSession.token });
+      const fabCatId = (catsRes.data.data as any[]).find((c) => c.category_code === 'CAT-FAB').id;
+
+      const createMat = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          sku: `FAB-INACT-${wmsRunTag}`,
+          name: 'Inactive Return Guard Test Fabric',
+          category_id: fabCatId,
+          base_uom: 'meter',
+          is_lot_tracked: false,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (createMat.status !== 201) {
+        throw new Error(`Setup inactive material failed (${createMat.status}): ${createMat.rawText}`);
+      }
+      const inactMatId = createMat.data.data.id;
+
+      const deactRes = await apiRequest(`/warehouse/materials/${inactMatId}`, {
+        method: 'PUT',
+        token: whMgrSession.token,
+        body: { status: 'inactive' },
+      });
+      if (deactRes.status !== 200 || deactRes.data?.data?.status !== 'inactive') {
+        throw new Error(`Expected 200 marking material inactive, got ${deactRes.status}: ${deactRes.rawText}`);
+      }
+
+      // Must be excluded from active material dropdown list
+      const activeList = await apiRequest(
+        `/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=RETURN&limit=500&offset=0`,
+        { token: whMgrSession.token }
+      );
+      if ((activeList.data.data as any[]).some((m) => m.id === inactMatId)) {
+        throw new Error('Inactive material leaked into active WH-RAW return materials list');
+      }
+
+      // Must be blocked on Return, Internal Transfer, and Inter-Warehouse Dispatch
+      const [retBlock, binBlock, dispBlock] = await Promise.all([
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrSession.token,
+          body: {
+            department_id: 11,
+            warehouse_id: whRawId,
+            material_id: inactMatId,
+            returned_qty: 2,
+            return_condition: 'USABLE_SURPLUS',
+          },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: whMgrSession.token,
+          body: {
+            warehouse_id: whRawId,
+            items: [
+              {
+                source_location_id: rawBinId,
+                target_location_id: rawDockBinId,
+                material_id: inactMatId,
+                quantity: 1,
+              },
+            ],
+          },
+        }),
+        apiRequest('/warehouse/transfers/dispatch', {
+          method: 'POST',
+          token: whMgrSession.token,
+          body: {
+            source_warehouse_id: whRawId,
+            target_warehouse_id: whTrimId,
+            items: [{ source_location_id: rawBinId, target_location_id: trimBinId, material_id: inactMatId, dispatched_qty: 1 }],
+          },
+        }),
+      ]);
+
+      if (retBlock.status !== 400 || binBlock.status !== 400 || dispBlock.status !== 400) {
+        throw new Error(
+          `Expected 400 INACTIVE_MATERIAL blocks: ret=${retBlock.status}, bin=${binBlock.status}, disp=${dispBlock.status}`
+        );
+      }
+
+      return 'Verified inactive materials are excluded from active dropdowns and blocked (400) across returns and transfers';
+    });
+
+    // 92. Zero-Stock Unlinked Return Flow & Incompatible Category/Scope Enforcement
+    await executeTest(92, 'Zero-Stock Return Allowance vs Incompatible Warehouse Block', 'WMS Returns & Transfers Bugfix', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrSession.token });
+      const fabCatId = (catsRes.data.data as any[]).find((c) => c.category_code === 'CAT-FAB').id;
+
+      const matRes = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          sku: `FAB-ZRET-${wmsRunTag}`,
+          name: 'Zero Stock Return Eligible Fabric',
+          category_id: fabCatId,
+          base_uom: 'meter',
+          is_lot_tracked: false,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (matRes.status !== 201) throw new Error(`Create material failed: ${matRes.rawText}`);
+      const zeroMatId = matRes.data.data.id;
+
+      // Appears in RETURN mode despite 0 stock, excluded from TRANSFER mode until stock > 0
+      const [retOpts, trfOpts] = await Promise.all([
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=RETURN&limit=500&offset=0`, {
+          token: whMgrSession.token,
+        }),
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=TRANSFER&limit=500&offset=0`, {
+          token: whMgrSession.token,
+        }),
+      ]);
+      if (!(retOpts.data.data as any[]).some((m) => m.id === zeroMatId)) {
+        throw new Error('Zero-stock compatible active material must appear for operation=RETURN');
+      }
+      if ((trfOpts.data.data as any[]).some((m) => m.id === zeroMatId)) {
+        throw new Error('Zero-stock material must NOT appear for operation=TRANSFER');
+      }
+
+      // Valid unlinked return when stock = 0 succeeds (201) and updates inventory_balances
+      const okRet = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: zeroMatId,
+          returned_qty: 4.5,
+          return_condition: 'USABLE_SURPLUS',
+          notes: 'Surplus zero-stock initial return',
+        },
+      });
+      if (okRet.status !== 201 || Number(okRet.data?.data?.balance?.qty_on_hand) !== 4.5) {
+        throw new Error(`Zero-stock unlinked return failed (${okRet.status}): ${okRet.rawText}`);
+      }
+
+      // Incompatible category return (FABRIC material into WH-TRIM) -> 400
+      const incompatRet = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whTrimId,
+          material_id: zeroMatId,
+          returned_qty: 1,
+          return_condition: 'DAMAGED',
+        },
+      });
+      if (incompatRet.status !== 400 || incompatRet.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL') {
+        throw new Error(`Expected 400 INCOMPATIBLE_WAREHOUSE_MATERIAL, got ${incompatRet.status}: ${incompatRet.rawText}`);
+      }
+
+      // Out-of-scope warehouse WH-FG -> 403
+      const scopeBlock = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whFgId,
+          material_id: zeroMatId,
+          returned_qty: 1,
+          return_condition: 'WASTE_SCRAP',
+        },
+      });
+      if (scopeBlock.status !== 403) {
+        throw new Error(`Expected 403 out-of-scope warehouse return, got ${scopeBlock.status}`);
+      }
+
+      return 'Verified zero-stock unlinked return succeeds (201), zero-stock excluded from TRANSFER, and incompatible/out-of-scope returns blocked';
+    });
+
+    // 93. Linked Stock Issue Return Validation (Department, Material & Cumulative Over-Return Guards)
+    await executeTest(93, 'Stock Issue Linked Return Validation (Dept/Material/Cap Guards)', 'WMS Returns & Transfers Bugfix', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrSession.token });
+      const fabCatId = (catsRes.data.data as any[]).find((c) => c.category_code === 'CAT-FAB').id;
+
+      const matRes = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          sku: `FAB-ISSRET-${wmsRunTag}`,
+          name: 'Linked Return Issue Test Fabric',
+          category_id: fabCatId,
+          base_uom: 'meter',
+          is_lot_tracked: false,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (matRes.status !== 201) throw new Error(`Create material failed: ${matRes.rawText}`);
+      const issMatId = matRes.data.data.id;
+
+      // Receive 10m into WH-RAW
+      const grnRes = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { warehouse_id: whRawId, supplier_name: 'Linked Return Supplier', po_reference: `PO-RET-${wmsRunTag}` },
+      });
+      const grnId = grnRes.data.data.grn.id;
+      await apiRequest(`/warehouse/grns/${grnId}/items`, {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { material_id: issMatId, target_location_id: rawBinId, received_qty: 10, accepted_qty: 10, unit_cost: 6.0 },
+      });
+      const postGrn = await apiRequest(`/warehouse/grns/${grnId}/post`, { method: 'POST', token: whMgrSession.token });
+      if (postGrn.status !== 200) throw new Error(`Post GRN failed: ${postGrn.rawText}`);
+
+      // Create, submit, approve & issue 10m to Dept #11 using active Dept Manager account
+      const deptMgrLogin = await loginViaHttp('deptuser', 'Dept@123');
+      const reqRes = await apiRequest('/warehouse/requisitions', {
+        method: 'POST',
+        token: deptMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          items: [{ material_id: issMatId, requested_qty: 10 }],
+        },
+      });
+      if (reqRes.status !== 201) throw new Error(`Create requisition failed (${reqRes.status}): ${reqRes.rawText}`);
+      const reqId = reqRes.data.data.requisition.id;
+      const reqItemId = reqRes.data.data.items[0].id;
+      const subRes = await apiRequest(`/warehouse/requisitions/${reqId}/submit`, { method: 'POST', token: deptMgrLogin.token });
+      if (subRes.status !== 200) throw new Error(`Submit requisition failed: ${subRes.rawText}`);
+      const appRes = await apiRequest(`/warehouse/requisitions/${reqId}/approve`, { method: 'POST', token: deptMgrLogin.token });
+      if (appRes.status !== 200) throw new Error(`Approve requisition failed: ${appRes.rawText}`);
+      const issRes = await apiRequest('/warehouse/issues', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { requisition_id: reqId, items: [{ requisition_item_id: reqItemId, location_id: rawBinId, issued_qty: 10 }] },
+      });
+      if (issRes.status !== 201) throw new Error(`Stock issue setup failed: ${issRes.rawText}`);
+      const issueId = issRes.data.data.issue.id;
+
+      // 1. Department mismatch (#12 instead of #11) -> 400
+      const wrongDept = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 12,
+          stock_issue_id: issueId,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: issMatId,
+          returned_qty: 2,
+          return_condition: 'DAMAGED',
+        },
+      });
+      if (wrongDept.status !== 400 || wrongDept.data?.error?.code !== 'RETURN_DEPARTMENT_MISMATCH') {
+        throw new Error(`Expected 400 RETURN_DEPARTMENT_MISMATCH, got ${wrongDept.status}: ${wrongDept.rawText}`);
+      }
+
+      // 2. Material mismatch (PKG-CTN-EXP-L is WH-RAW compatible, but was not on issueId) -> 400
+      const pkgMat = (await query<{ id: number }>(`SELECT id FROM materials WHERE sku = 'PKG-CTN-EXP-L'`)).rows[0];
+      const wrongMat = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          stock_issue_id: issueId,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: pkgMat.id,
+          returned_qty: 2,
+          return_condition: 'DAMAGED',
+        },
+      });
+      if (wrongMat.status !== 400 || wrongMat.data?.error?.code !== 'RETURN_MATERIAL_MISMATCH') {
+        throw new Error(`Expected 400 RETURN_MATERIAL_MISMATCH, got ${wrongMat.status}: ${wrongMat.rawText}`);
+      }
+
+      // 3. Valid partial returns (6 DAMAGED + 4 WASTE_SCRAP = 10) -> 201
+      const rA = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          stock_issue_id: issueId,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: issMatId,
+          returned_qty: 6,
+          return_condition: 'DAMAGED',
+        },
+      });
+      const rB = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          stock_issue_id: issueId,
+          warehouse_id: whRawId,
+          target_location_id: rawDockBinId,
+          material_id: issMatId,
+          returned_qty: 4,
+          return_condition: 'WASTE_SCRAP',
+        },
+      });
+      if (rA.status !== 201 || rB.status !== 201) {
+        throw new Error(`Expected 201 for valid linked returns, got rA=${rA.status}, rB=${rB.status}`);
+      }
+
+      // 4. Cumulative over-return (+1 > 10 issued) -> 409
+      const overRet = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          department_id: 11,
+          stock_issue_id: issueId,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: issMatId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      if (overRet.status !== 409 || overRet.data?.error?.code !== 'RETURN_EXCEEDS_ISSUED') {
+        throw new Error(`Expected 409 RETURN_EXCEEDS_ISSUED, got ${overRet.status}: ${overRet.rawText}`);
+      }
+
+      return 'Verified linked stock issue return validates department (400), material (400), and cumulative qty cap (409)';
+    });
+
+    // 94. Transfer Stock Availability Filter, Lot Preservation & Full Ledger Reconciliation
+    await executeTest(94, 'Transfer Positive-Stock Filter, Lot Preservation & Ledger Reconciliation', 'WMS Returns & Transfers Bugfix', async () => {
+      const whMgrSession = await loginViaHttp('whmanager', 'Warehouse@123');
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrSession.token });
+      const fabCatId = (catsRes.data.data as any[]).find((c) => c.category_code === 'CAT-FAB').id;
+
+      const matRes = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          sku: `FAB-TRF-${wmsRunTag}`,
+          name: 'Lot Transfer Traceability Fabric',
+          category_id: fabCatId,
+          base_uom: 'meter',
+          is_lot_tracked: true,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (matRes.status !== 201) throw new Error(`Create material failed: ${matRes.rawText}`);
+      const trfMatId = matRes.data.data.id;
+
+      // Receive 15m under explicit lot into WH-RAW rawBinId
+      const grnRes = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: { warehouse_id: whRawId, supplier_name: 'Lot Transfer Mill', po_reference: `PO-TRF-${wmsRunTag}` },
+      });
+      const grnId = grnRes.data.data.grn.id;
+      await apiRequest(`/warehouse/grns/${grnId}/items`, {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          material_id: trfMatId,
+          target_location_id: rawBinId,
+          received_qty: 15,
+          accepted_qty: 15,
+          unit_cost: 9.25,
+          lot_number: `LOT-TRF-${wmsRunTag}`,
+        },
+      });
+      const postGrn = await apiRequest(`/warehouse/grns/${grnId}/post`, { method: 'POST', token: whMgrSession.token });
+      if (postGrn.status !== 200) throw new Error(`Post GRN failed: ${postGrn.rawText}`);
+
+      const lotRow = (await query<{ id: number }>(`SELECT id FROM inventory_lots WHERE material_id = $1 LIMIT 1`, [trfMatId])).rows[0];
+
+      // operation=TRANSFER includes trfMatId in WH-RAW with available_qty=15, excludes from WH-TRIM (0 stock)
+      const [rawTrfList, trimTrfList] = await Promise.all([
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=TRANSFER&limit=500&offset=0`, {
+          token: whMgrSession.token,
+        }),
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whTrimId}&operation=TRANSFER&limit=500&offset=0`, {
+          token: whMgrSession.token,
+        }),
+      ]);
+      const rawEntry = (rawTrfList.data.data as any[]).find((m) => m.id === trfMatId);
+      if (!rawEntry || Number(rawEntry.available_qty) !== 15) {
+        throw new Error(`Expected trfMatId with available_qty=15 in WH-RAW TRANSFER list, got ${JSON.stringify(rawEntry)}`);
+      }
+      if ((trimTrfList.data.data as any[]).some((m) => m.id === trfMatId)) {
+        throw new Error('Zero-stock trfMatId must not appear in WH-TRIM TRANSFER list');
+      }
+
+      // Over-transfer (20 > 15) -> blocked 409
+      const overTrf = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [
+            {
+              source_location_id: rawBinId,
+              target_location_id: rawDockBinId,
+              material_id: trfMatId,
+              lot_id: lotRow.id,
+              quantity: 20,
+            },
+          ],
+        },
+      });
+      if (overTrf.status !== 409) {
+        throw new Error(`Expected 409 insufficient stock on over-transfer, got ${overTrf.status}: ${overTrf.rawText}`);
+      }
+
+      // Valid internal bin move of 6m preserves lot_id on destination bin
+      const okMove = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrSession.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [
+            {
+              source_location_id: rawBinId,
+              target_location_id: rawDockBinId,
+              material_id: trfMatId,
+              lot_id: lotRow.id,
+              quantity: 6,
+            },
+          ],
+        },
+      });
+      if (okMove.status !== 201) throw new Error(`Valid lot transfer failed (${okMove.status}): ${okMove.rawText}`);
+
+      const balCheck = await apiRequest(`/inventory/balances?warehouse_id=${whRawId}&material_id=${trfMatId}`, {
+        token: whMgrSession.token,
+      });
+      const srcBal = (balCheck.data.data as any[]).find((b) => b.location_id === rawBinId && b.lot_id === lotRow.id);
+      const dstBal = (balCheck.data.data as any[]).find((b) => b.location_id === rawDockBinId && b.lot_id === lotRow.id);
+      if (Number(srcBal?.qty_on_hand) !== 9 || Number(dstBal?.qty_on_hand) !== 6) {
+        throw new Error(`Lot balance mismatch after bin move: ${balCheck.rawText}`);
+      }
+
+      // Final full ledger reconciliation across entire DB
+      const financeLogin = await loginViaHttp('finance', 'Finance@123');
+      const recRes = await apiRequest('/inventory/reconcile', { token: financeLogin.token });
+      if (
+        recRes.status !== 200 ||
+        recRes.data?.data?.isBalanced !== true ||
+        !Array.isArray(recRes.data?.data?.discrepancies) ||
+        recRes.data.data.discrepancies.length !== 0
+      ) {
+        throw new Error(`Expected 0 ledger reconciliation discrepancies, got ${recRes.status}: ${recRes.rawText}`);
+      }
+
+      return 'Verified TRANSFER positive-stock filtering, 409 over-transfer guard, lot_id preservation across bins, and 0 ledger discrepancies';
+    });
+
+    // 95. SQL Adapter Output, Null Semantics & Engine Selection Verification
+    await executeTest(95, 'SQL Adapter Predicates (PostgreSQL Native vs pg-mem Fallback)', 'WMS Audit Remediation - Phase 1', async () => {
+      if (getDatabaseEngine() !== 'pg-mem' || !isPgMemEngine()) {
+        throw new Error(`Expected active test engine to be pg-mem, got ${getDatabaseEngine()}`);
+      }
+
+      const pgInt = sqlEqInt('r.warehouse_id', '$1', 'pg');
+      const memInt = sqlEqInt('r.warehouse_id', '$1', 'pg-mem');
+      if (pgInt !== 'r.warehouse_id = $1' || memInt !== 'r.warehouse_id + 0 = $1') {
+        throw new Error(`Unexpected sqlEqInt outputs: pg="${pgInt}", mem="${memInt}"`);
+      }
+
+      const pgText = sqlEqText('m.status', '$1', 'pg');
+      const memText = sqlEqText('m.status', '$1', 'pg-mem');
+      if (pgText !== 'm.status = $1' || memText !== "COALESCE(m.status, '') = $1") {
+        throw new Error(`Unexpected sqlEqText outputs: pg="${pgText}", mem="${memText}"`);
+      }
+
+      const pgIn = sqlInInt('id', '$1, $2', 'pg');
+      const memIn = sqlInInt('id', '$1, $2', 'pg-mem');
+      if (pgIn !== 'id IN ($1, $2)' || memIn !== 'id + 0 IN ($1, $2)') {
+        throw new Error(`Unexpected sqlInInt outputs: pg="${pgIn}", mem="${memIn}"`);
+      }
+
+      // Execute joined parameterized query using adapter helpers & verify NULL exclusion behavior
+      const activeCats = await query<any>(
+        `SELECT m.id, m.sku, m.color
+         FROM materials m
+         JOIN material_categories mc ON m.category_id = mc.id
+         WHERE ${sqlEqText('m.status', '$1')} AND ${sqlInInt('m.id', '$2, $3')}`,
+        ['active', matFabQcId, matNoQcId]
+      );
+      if (activeCats.rowCount !== 2) {
+        throw new Error(`Expected 2 materials from adapter-aware JOIN query, got ${activeCats.rowCount}`);
+      }
+
+      return 'Verified PG native indexable predicates, pg-mem compatibility predicates, and runtime JOIN execution';
+    });
+
+    // 96. WH-RAW (FABRIC + TRIM_ACCESSORY + PACKAGING + CONSUMABLE), WH-TRIM (TRIM_ACCESSORY + PACKAGING + CONSUMABLE), FINISHED_GOOD & FABRIC Rejection, Atomic Rollback & RBAC
+    await executeTest(96, 'WH-RAW & WH-TRIM Compatibility Matrix (All 4 WH-RAW Categories, Rejections, Rollback & RBAC)', 'WMS Audit Remediation - Phase 2', async () => {
+      const whMgrLogin = await loginViaHttp('whmanager', 'Warehouse@123');
+      const fmLogin = await loginViaHttp('manager', 'Manager@123');
+      const staffLogin = await loginViaHttp('deptstaff', 'Staff@123');
+
+      const trimDefaultLocId = (
+        await query<{ id: number }>(
+          `SELECT id FROM warehouse_locations WHERE warehouse_id = $1 AND status = 'active' ORDER BY is_default DESC, id ASC LIMIT 1`,
+          [whTrimId]
+        )
+      ).rows[0].id;
+
+      // Create an active CONSUMABLE material for WH-RAW & WH-TRIM compatibility verification
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrLogin.token });
+      const conCatId = (catsRes.data.data as any[]).find((c) => c.category_code === 'CAT-CON' || c.category_type === 'CONSUMABLE')?.id;
+      if (!conCatId) {
+        throw new Error(`Missing CAT-CON (CONSUMABLE) category: ${catsRes.rawText}`);
+      }
+      const conSku = `CON-AUD-${wmsRunTag}`;
+      const conCreate = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          sku: conSku,
+          name: 'QA Sewing Machine Needle Pack',
+          category_id: conCatId,
+          base_uom: 'box',
+          is_lot_tracked: false,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (conCreate.status !== 201) {
+        throw new Error(`Create CONSUMABLE test material failed: ${conCreate.rawText}`);
+      }
+      const matConId = conCreate.data.data.id;
+
+      // Seed positive AVAILABLE stock for TRIM_ACCESSORY, PACKAGING, CONSUMABLE in WH-RAW (and TRIM_ACCESSORY + CONSUMABLE in WH-TRIM)
+      const [beforeTrimInRaw, beforeTrimInTrim, beforePkgInRaw] = await Promise.all([
+        apiRequest(`/inventory/balances?warehouse_id=${whRawId}&material_id=${matTrimMoveId}`, { token: whMgrLogin.token }),
+        apiRequest(`/inventory/balances?warehouse_id=${whTrimId}&material_id=${matTrimMoveId}`, { token: whMgrLogin.token }),
+        apiRequest(`/inventory/balances?warehouse_id=${whRawId}&material_id=${matNoQcId}`, { token: whMgrLogin.token }),
+      ]);
+      const trimAvailRaw = (beforeTrimInRaw.data.data as any[])
+        .filter((b) => b.location_id === rawBinId && b.stock_status === 'AVAILABLE')
+        .reduce((s, b) => s + Number(b.qty_available), 0);
+      if (trimAvailRaw < 10) {
+        const g = await apiRequest('/warehouse/grns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { warehouse_id: whRawId, supplier_name: 'Audit Trim Supplier', po_reference: `PO-AUD-TRM-${wmsRunTag}` },
+        });
+        await apiRequest(`/warehouse/grns/${g.data.data.grn.id}/items`, {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { material_id: matTrimMoveId, target_location_id: rawBinId, received_qty: 10, accepted_qty: 10, unit_cost: 3.2 },
+        });
+        await apiRequest(`/warehouse/grns/${g.data.data.grn.id}/post`, { method: 'POST', token: whMgrLogin.token });
+      }
+      const trimAvailInTrim = (beforeTrimInTrim.data.data as any[])
+        .filter((b) => b.location_id === trimBinId && b.stock_status === 'AVAILABLE')
+        .reduce((s, b) => s + Number(b.qty_available), 0);
+      if (trimAvailInTrim < 5) {
+        const gT = await apiRequest('/warehouse/grns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { warehouse_id: whTrimId, supplier_name: 'Audit Trim Dest Supplier', po_reference: `PO-AUD-TRMT-${wmsRunTag}` },
+        });
+        await apiRequest(`/warehouse/grns/${gT.data.data.grn.id}/items`, {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { material_id: matTrimMoveId, target_location_id: trimBinId, received_qty: 5, accepted_qty: 5, unit_cost: 3.2 },
+        });
+        await apiRequest(`/warehouse/grns/${gT.data.data.grn.id}/post`, { method: 'POST', token: whMgrLogin.token });
+      }
+      const pkgAvailRaw = (beforePkgInRaw.data.data as any[])
+        .filter((b) => b.location_id === rawBinId && b.stock_status === 'AVAILABLE')
+        .reduce((s, b) => s + Number(b.qty_available), 0);
+      if (pkgAvailRaw < 10) {
+        const gP = await apiRequest('/warehouse/grns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { warehouse_id: whRawId, supplier_name: 'Audit Pkg Supplier', po_reference: `PO-AUD-PKG-${wmsRunTag}` },
+        });
+        await apiRequest(`/warehouse/grns/${gP.data.data.grn.id}/items`, {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { material_id: matNoQcId, target_location_id: rawBinId, received_qty: 10, accepted_qty: 10, unit_cost: 3.2 },
+        });
+        await apiRequest(`/warehouse/grns/${gP.data.data.grn.id}/post`, { method: 'POST', token: whMgrLogin.token });
+      }
+      const gConRaw = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: { warehouse_id: whRawId, supplier_name: 'Audit Consumables Supplier', po_reference: `PO-AUD-CON-${wmsRunTag}` },
+      });
+      await apiRequest(`/warehouse/grns/${gConRaw.data.data.grn.id}/items`, {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: { material_id: matConId, target_location_id: rawBinId, received_qty: 12, accepted_qty: 12, unit_cost: 1.5 },
+      });
+      await apiRequest(`/warehouse/grns/${gConRaw.data.data.grn.id}/post`, { method: 'POST', token: whMgrLogin.token });
+
+      // 0. Catalog filtering: WH-RAW RETURN & TRANSFER lists must include all 4 approved categories (FABRIC, TRIM_ACCESSORY, PACKAGING, CONSUMABLE) and exclude FINISHED_GOOD
+      const [rawRetCatalog, rawTrfCatalog] = await Promise.all([
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=RETURN&limit=500&offset=0`, { token: whMgrLogin.token }),
+        apiRequest(`/warehouse/materials?status=active&warehouse_id=${whRawId}&operation=TRANSFER&limit=500&offset=0`, { token: whMgrLogin.token }),
+      ]);
+      const rawRetIds = new Set((rawRetCatalog.data.data as any[]).map((m) => m.id));
+      const rawTrfIds = new Set((rawTrfCatalog.data.data as any[]).map((m) => m.id));
+      if (
+        !rawRetIds.has(matFabQcId) ||
+        !rawRetIds.has(matTrimMoveId) ||
+        !rawRetIds.has(matNoQcId) ||
+        !rawRetIds.has(matConId) ||
+        rawRetIds.has(matFgId)
+      ) {
+        throw new Error(`WH-RAW RETURN catalog missing one of the 4 allowed categories or leaked FINISHED_GOOD`);
+      }
+      if (
+        !rawTrfIds.has(matFabQcId) ||
+        !rawTrfIds.has(matTrimMoveId) ||
+        !rawTrfIds.has(matNoQcId) ||
+        !rawTrfIds.has(matConId) ||
+        rawTrfIds.has(matFgId)
+      ) {
+        throw new Error(`WH-RAW TRANSFER catalog missing one of the 4 allowed categories or leaked FINISHED_GOOD`);
+      }
+
+      // 1. FABRIC -> WH-RAW: Allowed (Return + Internal Bin Move)
+      const fabRetRaw = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matFabQcId,
+          lot_id: fabLot1Id,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      const fabBinRaw = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matFabQcId, lot_id: fabLot1Id, quantity: 1 }],
+        },
+      });
+      if (fabRetRaw.status !== 201 || fabBinRaw.status !== 201) {
+        throw new Error(`FABRIC -> WH-RAW failed: ret=${fabRetRaw.status}, bin=${fabBinRaw.status}`);
+      }
+
+      // 2. TRIM_ACCESSORY -> WH-RAW: Allowed (Return + Internal Bin Move)
+      const trimRetRaw = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matTrimMoveId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      const trimBinRaw = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matTrimMoveId, quantity: 1 }],
+        },
+      });
+      if (trimRetRaw.status !== 201 || trimBinRaw.status !== 201) {
+        throw new Error(`TRIM_ACCESSORY -> WH-RAW failed: ret=${trimRetRaw.status}, bin=${trimBinRaw.status}`);
+      }
+
+      // 3. PACKAGING -> WH-RAW: Allowed (Return + Internal Bin Move)
+      const pkgRetRaw = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matNoQcId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      const pkgBinRaw = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matNoQcId, quantity: 1 }],
+        },
+      });
+      if (pkgRetRaw.status !== 201 || pkgBinRaw.status !== 201) {
+        throw new Error(`PACKAGING -> WH-RAW failed: ret=${pkgRetRaw.status}, bin=${pkgBinRaw.status}`);
+      }
+
+      // 4. CONSUMABLE -> WH-RAW: Allowed (Return + Internal Bin Move)
+      const conRetRaw = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matConId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      const conBinRaw = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matConId, quantity: 1 }],
+        },
+      });
+      if (conRetRaw.status !== 201 || conBinRaw.status !== 201) {
+        throw new Error(`CONSUMABLE -> WH-RAW failed: ret=${conRetRaw.status}, bin=${conBinRaw.status}`);
+      }
+
+      // 5. WH-TRIM accepts TRIM_ACCESSORY, PACKAGING & CONSUMABLE (Return + Internal Bin Move)
+      const [trimRetTrim, pkgRetTrim, conRetTrim, trimBinTrim] = await Promise.all([
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { department_id: 11, warehouse_id: whTrimId, target_location_id: trimDefaultLocId, material_id: matTrimMoveId, returned_qty: 1, return_condition: 'USABLE_SURPLUS' },
+        }),
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { department_id: 11, warehouse_id: whTrimId, target_location_id: trimDefaultLocId, material_id: matNoQcId, returned_qty: 1, return_condition: 'USABLE_SURPLUS' },
+        }),
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { department_id: 11, warehouse_id: whTrimId, target_location_id: trimDefaultLocId, material_id: matConId, returned_qty: 1, return_condition: 'USABLE_SURPLUS' },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { warehouse_id: whTrimId, items: [{ source_location_id: trimBinId, target_location_id: trimDefaultLocId, material_id: matTrimMoveId, quantity: 1 }] },
+        }),
+      ]);
+      if (trimRetTrim.status !== 201 || pkgRetTrim.status !== 201 || conRetTrim.status !== 201 || trimBinTrim.status !== 201) {
+        throw new Error(`WH-TRIM compatible checks failed: trimRet=${trimRetTrim.status}, pkgRet=${pkgRetTrim.status}, conRet=${conRetTrim.status}, bin=${trimBinTrim.status}`);
+      }
+
+      // 6. Transfer TRIM_ACCESSORY, PACKAGING & CONSUMABLE from WH-RAW to WH-TRIM -> Allowed (201 dispatch -> 200 RECEIVED)
+      const okMultiDisp = await apiRequest('/warehouse/transfers/dispatch', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          source_warehouse_id: whRawId,
+          target_warehouse_id: whTrimId,
+          items: [
+            { source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matTrimMoveId, dispatched_qty: 2 },
+            { source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matNoQcId, dispatched_qty: 2 },
+            { source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matConId, dispatched_qty: 2 },
+          ],
+        },
+      });
+      if (okMultiDisp.status !== 201) {
+        throw new Error(`Expected 201 for compatible WH-RAW -> WH-TRIM transfer (TRIM/PKG/CON), got ${okMultiDisp.status}: ${okMultiDisp.rawText}`);
+      }
+      const okMultiRec = await apiRequest(`/warehouse/transfers/${okMultiDisp.data.data.transfer.id}/receive`, {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          items: okMultiDisp.data.data.items.map((it: any) => ({
+            transfer_item_id: it.id,
+            received_qty: Number(it.dispatched_qty),
+            damaged_qty: 0,
+            discrepancy_qty: 0,
+          })),
+        },
+      });
+      if (okMultiRec.status !== 200 || okMultiRec.data?.data?.transfer?.status !== 'RECEIVED') {
+        throw new Error(`Expected 200 RECEIVED on TRIM/PKG/CON transfer receipt, got ${okMultiRec.status}: ${okMultiRec.rawText}`);
+      }
+
+      // 7. Genuinely incompatible category rejections:
+      // 7a. FINISHED_GOOD -> WH-RAW (Return + Internal Bin Move + Inter-warehouse Dispatch) -> 400 INCOMPATIBLE_WAREHOUSE_MATERIAL
+      const fgLotRes = await query<{ id: number }>(`SELECT id FROM inventory_lots WHERE material_id = $1 LIMIT 1`, [matFgId]);
+      const fgLotId = fgLotRes.rows[0]?.id ?? null;
+      const [fgRetRaw, fgBinRaw, fgToTrimDisp] = await Promise.all([
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            department_id: 11,
+            warehouse_id: whRawId,
+            target_location_id: rawBinId,
+            material_id: matFgId,
+            lot_id: fgLotId,
+            returned_qty: 1,
+            return_condition: 'USABLE_SURPLUS',
+          },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            warehouse_id: whRawId,
+            items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matFgId, lot_id: fgLotId, quantity: 1 }],
+          },
+        }),
+        apiRequest('/warehouse/transfers/dispatch', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            source_warehouse_id: whRawId,
+            target_warehouse_id: whTrimId,
+            items: [{ source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matFgId, lot_id: fgLotId, dispatched_qty: 1 }],
+          },
+        }),
+      ]);
+      if (
+        fgRetRaw.status !== 400 ||
+        fgRetRaw.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL' ||
+        fgBinRaw.status !== 400 ||
+        fgBinRaw.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL' ||
+        fgToTrimDisp.status !== 400 ||
+        fgToTrimDisp.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+      ) {
+        throw new Error(
+          `Expected 400 INCOMPATIBLE_WAREHOUSE_MATERIAL for FINISHED_GOOD -> WH-RAW: ret=${fgRetRaw.status}, bin=${fgBinRaw.status}, disp=${fgToTrimDisp.status}`
+        );
+      }
+
+      // 7b. FABRIC -> WH-TRIM (Return + Internal Bin Move + Inter-warehouse WH-RAW->WH-TRIM Dispatch) -> 400 INCOMPATIBLE_WAREHOUSE_MATERIAL
+      const [fabRetTrim, fabBinTrim, fabToTrimDisp] = await Promise.all([
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            department_id: 11,
+            warehouse_id: whTrimId,
+            target_location_id: trimDefaultLocId,
+            material_id: matFabQcId,
+            lot_id: fabLot1Id,
+            returned_qty: 1,
+            return_condition: 'USABLE_SURPLUS',
+          },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            warehouse_id: whTrimId,
+            items: [{ source_location_id: trimBinId, target_location_id: trimDefaultLocId, material_id: matFabQcId, lot_id: fabLot1Id, quantity: 1 }],
+          },
+        }),
+        apiRequest('/warehouse/transfers/dispatch', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            source_warehouse_id: whRawId,
+            target_warehouse_id: whTrimId,
+            items: [{ source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matFabQcId, lot_id: fabLot1Id, dispatched_qty: 1 }],
+          },
+        }),
+      ]);
+      if (
+        fabRetTrim.status !== 400 ||
+        fabRetTrim.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL' ||
+        fabBinTrim.status !== 400 ||
+        fabBinTrim.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL' ||
+        fabToTrimDisp.status !== 400 ||
+        fabToTrimDisp.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+      ) {
+        throw new Error(
+          `Expected 400 INCOMPATIBLE_WAREHOUSE_MATERIAL for FABRIC -> WH-TRIM: ret=${fabRetTrim.status}, bin=${fabBinTrim.status}, disp=${fabToTrimDisp.status}`
+        );
+      }
+
+      // 8. Multi-line Atomic Rollback (Inter-Warehouse Dispatch & Internal Bin Move):
+      const pkgSnapBefore = await apiRequest(`/inventory/balances?warehouse_id=${whRawId}&material_id=${matNoQcId}`, {
+        token: whMgrLogin.token,
+      });
+      const pkgQtyBefore = (pkgSnapBefore.data.data as any[])
+        .filter((b) => b.location_id === rawBinId && b.stock_status === 'AVAILABLE')
+        .reduce((s, b) => s + Number(b.qty_on_hand), 0);
+
+      // Line 1 compatible PACKAGING (WH-RAW -> WH-TRIM) + Line 2 incompatible FABRIC -> must roll back Line 1!
+      const multiDispatchFail = await apiRequest('/warehouse/transfers/dispatch', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          source_warehouse_id: whRawId,
+          target_warehouse_id: whTrimId,
+          items: [
+            { source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matNoQcId, dispatched_qty: 2 },
+            { source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matFabQcId, lot_id: fabLot1Id, dispatched_qty: 1 },
+          ],
+        },
+      });
+      // Line 1 compatible PACKAGING bin move + Line 2 incompatible FINISHED_GOOD bin move inside WH-RAW -> must roll back Line 1!
+      const multiBinFail = await apiRequest('/warehouse/transfers/internal', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          warehouse_id: whRawId,
+          items: [
+            { source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matNoQcId, quantity: 2 },
+            { source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matFgId, lot_id: fgLotId, quantity: 1 },
+          ],
+        },
+      });
+      if (
+        multiDispatchFail.status !== 400 ||
+        multiDispatchFail.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL' ||
+        multiBinFail.status !== 400 ||
+        multiBinFail.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+      ) {
+        throw new Error(`Expected 400 multi-line rejections, got disp=${multiDispatchFail.status}, bin=${multiBinFail.status}`);
+      }
+      const pkgSnapAfter = await apiRequest(`/inventory/balances?warehouse_id=${whRawId}&material_id=${matNoQcId}`, {
+        token: whMgrLogin.token,
+      });
+      const pkgQtyAfter = (pkgSnapAfter.data.data as any[])
+        .filter((b) => b.location_id === rawBinId && b.stock_status === 'AVAILABLE')
+        .reduce((s, b) => s + Number(b.qty_on_hand), 0);
+      if (pkgQtyAfter !== pkgQtyBefore) {
+        throw new Error(`Atomic rollback failed! Line 1 balance changed from ${pkgQtyBefore} to ${pkgQtyAfter}`);
+      }
+
+      // 9. FABRIC -> WH-FG (FINISHED_GOODS) + Defensive receiveInterWarehouseTransfer compatibility guard
+      const fabToFg = await apiRequest('/warehouse/transfers/dispatch', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          source_warehouse_id: whRawId,
+          target_warehouse_id: whFgId,
+          items: [{ source_location_id: rawBinId, material_id: matFabQcId, lot_id: fabLot1Id, dispatched_qty: 1 }],
+        },
+      });
+      if (fabToFg.status !== 400 || fabToFg.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL') {
+        throw new Error(`Expected 400 INCOMPATIBLE_WAREHOUSE_MATERIAL for FABRIC -> WH-FG, got ${fabToFg.status}: ${fabToFg.rawText}`);
+      }
+
+      const tamperedTrf = await query<{ id: number }>(
+        `INSERT INTO warehouse_transfers (transfer_number, transfer_type, source_warehouse_id, target_warehouse_id, status, dispatched_by, dispatched_at, created_by)
+         VALUES ($1, 'INTER_WAREHOUSE', $2, $3, 'IN_TRANSIT', $4, NOW(), $4) RETURNING id`,
+        [`TRF-DEF-${wmsRunTag}`, whRawId, whTrimId, whMgrLogin.user.id]
+      );
+      const tamperedItem = await query<{ id: number }>(
+        `INSERT INTO warehouse_transfer_items (transfer_id, source_warehouse_id, source_location_id, target_warehouse_id, target_location_id, material_id, lot_id, dispatched_qty, unit_cost)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, 5.00) RETURNING id`,
+        [tamperedTrf.rows[0].id, whRawId, rawBinId, whTrimId, trimDefaultLocId, matFabQcId, fabLot1Id]
+      );
+      const recGuard = await apiRequest(`/warehouse/transfers/${tamperedTrf.rows[0].id}/receive`, {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: { items: [{ transfer_item_id: tamperedItem.rows[0].id, received_qty: 1, damaged_qty: 0, discrepancy_qty: 0 }] },
+      });
+      if (recGuard.status !== 400 || recGuard.data?.error?.code !== 'INCOMPATIBLE_WAREHOUSE_MATERIAL') {
+        throw new Error(`Expected 400 INCOMPATIBLE_WAREHOUSE_MATERIAL on defensive receive guard, got ${recGuard.status}: ${recGuard.rawText}`);
+      }
+      await query(`DELETE FROM warehouse_transfer_items WHERE transfer_id = $1`, [tamperedTrf.rows[0].id]);
+      await query(`DELETE FROM warehouse_transfers WHERE id = $1`, [tamperedTrf.rows[0].id]);
+
+      // 10. Unauthorized RBAC enforcement (deptstaff -> 403, fm lacking inventory:transfer -> 403, out-of-scope whmanager WH-FG -> 403)
+      const [unauthRet, unauthBin, fmTransferBlock, whFgScopeBlock] = await Promise.all([
+        apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: staffLogin.token,
+          body: { department_id: 11, warehouse_id: whRawId, material_id: matNoQcId, returned_qty: 1, return_condition: 'USABLE_SURPLUS' },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: staffLogin.token,
+          body: { warehouse_id: whRawId, items: [{ source_location_id: rawBinId, target_location_id: rawDockBinId, material_id: matNoQcId, quantity: 1 }] },
+        }),
+        apiRequest('/warehouse/transfers/dispatch', {
+          method: 'POST',
+          token: fmLogin.token,
+          body: { source_warehouse_id: whRawId, target_warehouse_id: whTrimId, items: [{ source_location_id: rawBinId, target_location_id: trimDefaultLocId, material_id: matNoQcId, dispatched_qty: 1 }] },
+        }),
+        apiRequest('/warehouse/transfers/internal', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: { warehouse_id: whFgId, items: [{ source_location_id: 1, target_location_id: 2, material_id: matFgId, quantity: 1 }] },
+        }),
+      ]);
+      if (unauthRet.status !== 403 || unauthBin.status !== 403 || fmTransferBlock.status !== 403 || whFgScopeBlock.status !== 403) {
+        throw new Error(
+          `RBAC enforcement gap: unauthRet=${unauthRet.status}, unauthBin=${unauthBin.status}, fmDisp=${fmTransferBlock.status}, whFgScope=${whFgScopeBlock.status}`
+        );
+      }
+
+      return 'Verified all 4 WH-RAW categories (FABRIC, TRIM_ACCESSORY, PACKAGING, CONSUMABLE), WH-TRIM rules, FINISHED_GOOD/FABRIC rejections, atomic rollbacks, and RBAC 403s';
+    });
+
+    // 97. Lot-Tracked Return Enforcement & End-to-End Traceability
+    await executeTest(97, 'Lot-Tracked Return Enforcement & Warehouse Traceability', 'WMS Audit Remediation - Phase 3', async () => {
+      const whMgrLogin = await loginViaHttp('whmanager', 'Warehouse@123');
+      const lotBeforeRes = await query<{ remaining_qty: string }>(`SELECT remaining_qty FROM inventory_lots WHERE id = $1`, [fabLot1Id]);
+      const remBefore = Number(lotBeforeRes.rows[0].remaining_qty);
+
+      // 1. Unlinked lot-tracked return omitting lot_id -> 400 LOT_REQUIRED
+      const unlinkedNoLot = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matFabQcId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      if (unlinkedNoLot.status !== 400 || unlinkedNoLot.data?.error?.code !== 'LOT_REQUIRED') {
+        throw new Error(`Expected 400 LOT_REQUIRED on unlinked lot-tracked return, got ${unlinkedNoLot.status}: ${unlinkedNoLot.rawText}`);
+      }
+
+      // 2. Wrong material lot_id -> 400 LOT_MATERIAL_MISMATCH
+      const trmLotRes = await query<{ id: number }>(`SELECT id FROM inventory_lots WHERE material_id = $1 LIMIT 1`, [matLotFifoId]);
+      if (trmLotRes.rowCount > 0) {
+        const wrongMatLot = await apiRequest('/warehouse/returns', {
+          method: 'POST',
+          token: whMgrLogin.token,
+          body: {
+            department_id: 11,
+            warehouse_id: whRawId,
+            target_location_id: rawBinId,
+            material_id: matFabQcId,
+            lot_id: trmLotRes.rows[0].id,
+            returned_qty: 1,
+            return_condition: 'USABLE_SURPLUS',
+          },
+        });
+        if (wrongMatLot.status !== 400 || wrongMatLot.data?.error?.code !== 'LOT_MATERIAL_MISMATCH') {
+          throw new Error(`Expected 400 LOT_MATERIAL_MISMATCH, got ${wrongMatLot.status}: ${wrongMatLot.rawText}`);
+        }
+      }
+
+      // 3. Warehouse traceability check: lot-tracked PACKAGING material (compatible with both WH-TRIM & WH-RAW) whose lot belongs only to WH-TRIM cannot be unlinked-returned to WH-RAW
+      const catsRes = await apiRequest('/warehouse/categories', { token: whMgrLogin.token });
+      const pkgCat = (catsRes.data?.data as any[] | undefined)?.find((c) => c.category_code === 'CAT-PKG');
+      if (!pkgCat) {
+        throw new Error(`Missing CAT-PKG category: ${catsRes.rawText}`);
+      }
+      const pkgLotMatRes = await apiRequest('/warehouse/materials', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          sku: `PKG-LOT-${wmsRunTag}`,
+          name: 'Lot Tracked Export Carton',
+          category_id: pkgCat.id,
+          base_uom: 'pcs',
+          is_lot_tracked: true,
+          is_roll_tracked: false,
+          requires_qc_on_receipt: false,
+        },
+      });
+      if (pkgLotMatRes.status !== 201) {
+        throw new Error(`Create pkgLotMat failed (${pkgLotMatRes.status}): ${pkgLotMatRes.rawText}`);
+      }
+      const pkgLotMatId = pkgLotMatRes.data.data.id;
+      const trimGrn = await apiRequest('/warehouse/grns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: { warehouse_id: whTrimId, supplier_name: 'Carton Lot Supplier', po_reference: `PO-PKGLOT-${wmsRunTag}` },
+      });
+      if (trimGrn.status !== 201) {
+        throw new Error(`Create trimGrn failed (${trimGrn.status}): ${trimGrn.rawText}`);
+      }
+      const trimDefaultLocId = (
+        await query<{ id: number }>(
+          `SELECT id FROM warehouse_locations WHERE warehouse_id = $1 AND status = 'active' ORDER BY is_default DESC, id ASC LIMIT 1`,
+          [whTrimId]
+        )
+      ).rows[0].id;
+      const trimGrnItemRes = await apiRequest(`/warehouse/grns/${trimGrn.data.data.grn.id}/items`, {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          material_id: pkgLotMatId,
+          target_location_id: trimDefaultLocId,
+          received_qty: 5,
+          accepted_qty: 5,
+          unit_cost: 3.0,
+          lot_number: `PKGLOT-${wmsRunTag}`,
+        },
+      });
+      if (trimGrnItemRes.status !== 201) {
+        throw new Error(`Add trimGrn item failed (${trimGrnItemRes.status}): ${trimGrnItemRes.rawText}`);
+      }
+      const trimPostRes = await apiRequest(`/warehouse/grns/${trimGrn.data.data.grn.id}/post`, {
+        method: 'POST',
+        token: whMgrLogin.token,
+      });
+      if (trimPostRes.status !== 200) {
+        throw new Error(`Post trimGrn failed (${trimPostRes.status}): ${trimPostRes.rawText}`);
+      }
+      const pkgLotQuery = await query<{ id: number }>(`SELECT id FROM inventory_lots WHERE material_id = $1 LIMIT 1`, [pkgLotMatId]);
+      if (pkgLotQuery.rowCount === 0) {
+        throw new Error(`Expected inventory lot for pkgLotMatId=${pkgLotMatId}`);
+      }
+      const pkgLotId = pkgLotQuery.rows[0].id;
+
+      const wrongWhLot = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          material_id: pkgLotMatId,
+          lot_id: pkgLotId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      if (wrongWhLot.status !== 400 || wrongWhLot.data?.error?.code !== 'RETURN_LOT_WAREHOUSE_MISMATCH') {
+        throw new Error(`Expected 400 RETURN_LOT_WAREHOUSE_MISMATCH, got ${wrongWhLot.status}: ${wrongWhLot.rawText}`);
+      }
+
+      // 4. Valid unlinked lot-tracked return preserves lot_id across material_returns, inventory_balances, stock_movements, inventory_lots
+      const okLotRet = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matFabQcId,
+          lot_id: fabLot1Id,
+          returned_qty: 2,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      if (okLotRet.status !== 201) {
+        throw new Error(`Valid unlinked lot return failed (${okLotRet.status}): ${okLotRet.rawText}`);
+      }
+      if (
+        okLotRet.data?.data?.material_return?.lot_id !== fabLot1Id ||
+        okLotRet.data?.data?.balance?.lot_id !== fabLot1Id ||
+        okLotRet.data?.data?.movement?.lot_id !== fabLot1Id
+      ) {
+        throw new Error(`Lot ID was not preserved across return/balance/movement: ${okLotRet.rawText}`);
+      }
+      const lotAfterRes = await query<{ remaining_qty: string }>(`SELECT remaining_qty FROM inventory_lots WHERE id = $1`, [fabLot1Id]);
+      if (Number(lotAfterRes.rows[0].remaining_qty) !== remBefore + 2) {
+        throw new Error(`Expected inventory_lots.remaining_qty=${remBefore + 2}, got ${lotAfterRes.rows[0].remaining_qty}`);
+      }
+
+      // 5. Non-lot-tracked compatible PACKAGING return succeeds without lot_id
+      const okNoLotRet = await apiRequest('/warehouse/returns', {
+        method: 'POST',
+        token: whMgrLogin.token,
+        body: {
+          department_id: 11,
+          warehouse_id: whRawId,
+          target_location_id: rawBinId,
+          material_id: matNoQcId,
+          returned_qty: 1,
+          return_condition: 'USABLE_SURPLUS',
+        },
+      });
+      if (okNoLotRet.status !== 201) {
+        throw new Error(`Non-lot-tracked return without lot_id failed: ${okNoLotRet.rawText}`);
+      }
+
+      return 'Verified LOT_REQUIRED, LOT_MATERIAL_MISMATCH, RETURN_LOT_WAREHOUSE_MISMATCH, and end-to-end lot traceability';
+    });
+
+    // 98. Scoped /warehouse/departments Lookup & Actor RBAC Enforcement
+    await executeTest(98, 'Scoped /warehouse/departments Lookup RBAC & Minimal Fields', 'WMS Audit Remediation - Phase 5', async () => {
+      const whMgrLogin = await loginViaHttp('whmanager', 'Warehouse@123');
+      const deptMgrLogin = await loginViaHttp('deptuser', 'Dept@123');
+      const deptStaffLogin = await loginViaHttp('deptstaff', 'Staff@123');
+      const plannerLogin = await loginViaHttp('planner', 'Planner@123');
+
+      // Warehouse Manager -> gets active departments with minimal keys only
+      const whMgrDepts = await apiRequest('/warehouse/departments', { token: whMgrLogin.token });
+      if (whMgrDepts.status !== 200 || !Array.isArray(whMgrDepts.data?.data) || whMgrDepts.data.data.length === 0) {
+        throw new Error(`Expected active departments for whmanager, got ${whMgrDepts.status}: ${whMgrDepts.rawText}`);
+      }
+      const sampleKeys = Object.keys(whMgrDepts.data.data[0]).sort().join(',');
+      if (sampleKeys !== 'dept_code,id,name,status') {
+        throw new Error(`Unexpected department lookup payload keys (sensitive fields leaked?): ${sampleKeys}`);
+      }
+      if ((whMgrDepts.data.data as any[]).some((d) => d.status !== 'active')) {
+        throw new Error('Inactive department leaked into /warehouse/departments');
+      }
+
+      // Department Manager (deptuser, manages DEP-CUT #11) -> strictly scoped to [11]
+      const deptMgrDepts = await apiRequest('/warehouse/departments', { token: deptMgrLogin.token });
+      if (
+        deptMgrDepts.status !== 200 ||
+        deptMgrDepts.data.data.length !== 1 ||
+        deptMgrDepts.data.data[0].id !== 11
+      ) {
+        throw new Error(`Expected strictly Dept #11 for Department Manager, got ${deptMgrDepts.rawText}`);
+      }
+
+      // Department User & Department Planner -> blocked 403
+      const [staffRes, plannerRes] = await Promise.all([
+        apiRequest('/warehouse/departments', { token: deptStaffLogin.token }),
+        apiRequest('/warehouse/departments', { token: plannerLogin.token }),
+      ]);
+      if (staffRes.status !== 403 || plannerRes.status !== 403) {
+        throw new Error(`Expected 403 for deptstaff (${staffRes.status}) and planner (${plannerRes.status})`);
+      }
+
+      // Unassigned Warehouse Keeper (no managed warehouses) -> fail-closed empty list []
+      const tempWkNone = await createTempUser(`wk_none98_${wmsRunTag}`, [roleIdByName.get('Warehouse Keeper')!]);
+      try {
+        const wkNone98Login = await loginViaHttp(tempWkNone.user.username, tempWkNone.password);
+        const unassignRes = await apiRequest('/warehouse/departments', { token: wkNone98Login.token });
+        if (unassignRes.status !== 200 || unassignRes.data.data.length !== 0) {
+          throw new Error(`Expected [] for unassigned warehouse keeper, got ${unassignRes.status}: ${unassignRes.rawText}`);
+        }
+      } finally {
+        await cleanupTempUser(tempWkNone.user.id);
+      }
+
+      // Warehouse Keeper assigned to WH-RAW (whkeeper) -> gets active departments + can fetch /inventory/lots
+      const wkActiveLogin = await loginViaHttp('whkeeper', 'Keeper@123');
+      const [wkDepts, wkLots] = await Promise.all([
+        apiRequest('/warehouse/departments', { token: wkActiveLogin.token }),
+        apiRequest(`/inventory/lots?warehouse_id=${whRawId}&material_id=${matFabQcId}`, { token: wkActiveLogin.token }),
+      ]);
+      if (wkDepts.status !== 200 || wkDepts.data.data.length === 0 || wkLots.status !== 200) {
+        throw new Error(`Assigned Warehouse Keeper lookup failed: depts=${wkDepts.status}, lots=${wkLots.status}`);
+      }
+
+      return 'Verified /warehouse/departments active minimal payload, Department Manager scoping, 403 blocks, and unassigned fail-closed behavior';
+    });
+
+    // 99. Scoped & Full Live Inventory Ledger Reconciliation
+    await executeTest(99, 'Scoped & Full Uncached Inventory Reconciliation Report', 'WMS Audit Remediation - Phase 6', async () => {
+      const finLogin = await loginViaHttp('finance', 'Finance@123');
+
+      const [fullRes, whRes, matRes, bothRes] = await Promise.all([
+        apiRequest('/inventory/reconcile', { token: finLogin.token }),
+        apiRequest(`/inventory/reconcile?warehouse_id=${whRawId}`, { token: finLogin.token }),
+        apiRequest(`/inventory/reconcile?material_id=${matFabQcId}`, { token: finLogin.token }),
+        apiRequest(`/inventory/reconcile?warehouse_id=${whRawId}&material_id=${matFabQcId}`, { token: finLogin.token }),
+      ]);
+
+      for (const [label, r] of [
+        ['FULL', fullRes],
+        ['WAREHOUSE', whRes],
+        ['MATERIAL', matRes],
+        ['WAREHOUSE_MATERIAL', bothRes],
+      ] as const) {
+        if (r.status !== 200 || r.data?.data?.isBalanced !== true || r.data?.data?.discrepancies?.length !== 0) {
+          throw new Error(`Reconciliation "${label}" failed: ${r.status} ${r.rawText}`);
+        }
+        if (r.data?.data?.scope?.mode !== label) {
+          throw new Error(`Expected scope.mode="${label}", got ${JSON.stringify(r.data?.data?.scope)}`);
+        }
+        if (typeof r.data?.data?.execution_time_ms !== 'number' || typeof r.data?.data?.checked_pairs_count !== 'number') {
+          throw new Error(`Missing timing/count metadata in "${label}": ${r.rawText}`);
+        }
+      }
+
+      if (fullRes.data.data.checked_pairs_count < bothRes.data.data.checked_pairs_count) {
+        throw new Error('Full reconciliation checked fewer pairs than single warehouse+material scope');
+      }
+
+      return `Verified live uncached reconciliation across full (${fullRes.data.data.checked_pairs_count} pairs) and scoped modes`;
     });
   } finally {
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));

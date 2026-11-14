@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { AuthService } from './auth.service.ts';
+import { clearLoginFailuresForAccount, recordLoginFailure } from '../../middleware/rate-limit.middleware.ts';
 
 export class AuthController {
   static async login(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -13,11 +14,16 @@ export class AuthController {
         ipAddress: ipAddress.split(',')[0].trim(),
       });
 
+      clearLoginFailuresForAccount(req, username);
+
       res.status(200).json({
         success: true,
         data: result,
       });
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.statusCode === 401 || err?.statusCode === 403) {
+        recordLoginFailure(req, req.body?.username);
+      }
       next(err);
     }
   }

@@ -1,4 +1,4 @@
-import { query, QueryFn, withTransaction } from '../../config/database.ts';
+import { query, QueryFn, sqlEqInt, sqlEqText, withTransaction } from '../../config/database.ts';
 import { hasGlobalWarehouseAccess } from '../../middleware/auth.middleware.ts';
 import { AuditService } from '../audit/audit.service.ts';
 import { InventoryEngineService } from './inventory-engine.service.ts';
@@ -13,7 +13,7 @@ import {
   parsePositiveNumber,
   roundQty,
 } from './warehouse.errors.ts';
-import { RETURN_CONDITIONS, ReturnCondition, WarehouseActor } from './warehouse.types.ts';
+import { isCategoryCompatibleWithWarehouse, RETURN_CONDITIONS, ReturnCondition, WarehouseActor } from './warehouse.types.ts';
 
 export class WarehouseOutboundService {
   private static assertActorCanAccessRequisition(actor: WarehouseActor, reqRow: any): void {
@@ -58,19 +58,19 @@ export class WarehouseOutboundService {
     `;
     if (filter?.status) {
       params.push(filter.status);
-      sql += ` AND r.status = $${params.length}`;
+      sql += ` AND ${sqlEqText('r.status', `$${params.length}`)}`;
     }
     if (filter?.warehouse_id) {
       params.push(filter.warehouse_id);
-      sql += ` AND r.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('r.warehouse_id', `$${params.length}`)}`;
     }
     if (filter?.department_id) {
       params.push(filter.department_id);
-      sql += ` AND r.department_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('r.department_id', `$${params.length}`)}`;
     }
     if (filter?.production_line_id) {
       params.push(filter.production_line_id);
-      sql += ` AND r.production_line_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('r.production_line_id', `$${params.length}`)}`;
     }
     sql += ` ORDER BY r.id DESC`;
 
@@ -119,7 +119,7 @@ export class WarehouseOutboundService {
        FROM material_requisition_items ri
        JOIN materials m ON ri.material_id = m.id
        LEFT JOIN inventory_lots lot ON ri.preferred_lot_id = lot.id
-       WHERE ri.requisition_id + 0 = $1
+       WHERE ${sqlEqInt('ri.requisition_id', '$1')}
        ORDER BY ri.id ASC`,
       [requisitionId]
     );
@@ -512,7 +512,7 @@ export class WarehouseOutboundService {
     `;
     if (warehouseId) {
       params.push(warehouseId);
-      sql += ` AND si.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('si.warehouse_id', `$${params.length}`)}`;
     }
     sql += ` ORDER BY si.id DESC`;
     const res = await query<any>(sql, params);
@@ -552,7 +552,7 @@ export class WarehouseOutboundService {
        JOIN materials m ON sii.material_id = m.id
        JOIN warehouse_locations l ON sii.location_id = l.id
        LEFT JOIN inventory_lots lot ON sii.lot_id = lot.id
-       WHERE sii.issue_id + 0 = $1
+       WHERE ${sqlEqInt('sii.issue_id', '$1')}
        ORDER BY sii.id ASC`,
       [issueId]
     );
@@ -877,17 +877,18 @@ export class WarehouseOutboundService {
     const params: any[] = [];
     let sql = `
       SELECT mr.*, d.dept_code, w.warehouse_code, m.sku, m.name as material_name,
-             lot.lot_number, lot.roll_number
+             lot.lot_number, lot.roll_number, ru.username as returned_by_username
       FROM material_returns mr
       JOIN departments d ON mr.department_id = d.id
       JOIN warehouses w ON mr.warehouse_id = w.id
       JOIN materials m ON mr.material_id = m.id
       LEFT JOIN inventory_lots lot ON mr.lot_id = lot.id
+      LEFT JOIN users ru ON mr.returned_by = ru.id
       WHERE 1=1
     `;
     if (warehouseId) {
       params.push(warehouseId);
-      sql += ` AND mr.warehouse_id + 0 = $${params.length}`;
+      sql += ` AND ${sqlEqInt('mr.warehouse_id', `$${params.length}`)}`;
     }
     sql += ` ORDER BY mr.id DESC`;
     const res = await query<any>(sql, params);
@@ -921,7 +922,13 @@ export class WarehouseOutboundService {
     const warehouseId = parsePositiveInt(dto.warehouse_id, 'warehouse_id');
     const materialId = parsePositiveInt(dto.material_id, 'material_id');
     const returnedQty = parsePositiveNumber(dto.returned_qty, 'returned_qty');
-    const condition = parseEnumValue(dto.return_condition, RETURN_CONDITIONS, 'return_condition');
+    const normalizedCondition =
+      (dto.return_condition as string) === 'USABLE' || (dto.return_condition as string) === 'SURPLUS'
+        ? 'USABLE_SURPLUS'
+        : (dto.return_condition as string) === 'WASTE' || (dto.return_condition as string) === 'SCRAP'
+          ? 'WASTE_SCRAP'
+          : dto.return_condition;
+    const condition = parseEnumValue(normalizedCondition, RETURN_CONDITIONS, 'return_condition');
     const lineId =
       dto.production_line_id !== undefined && dto.production_line_id !== null
         ? parsePositiveInt(dto.production_line_id, 'production_line_id')
@@ -933,6 +940,10 @@ export class WarehouseOutboundService {
     const lotId =
       dto.lot_id !== undefined && dto.lot_id !== null ? parsePositiveInt(dto.lot_id, 'lot_id') : null;
 
+    if (!hasGlobalWarehouseAccess(actor as any) && !actor.managed_warehouse_ids.includes(warehouseId)) {
+      throw forbidden(`Access denied. Warehouse #${warehouseId} is outside your assigned warehouse scope`);
+    }
+
     const targetStockStatus =
       condition === 'USABLE_SURPLUS'
         ? 'AVAILABLE'
@@ -941,12 +952,91 @@ export class WarehouseOutboundService {
           : 'SCRAP';
 
     return withTransaction(async (txQuery) => {
-      const [deptRes, matRes] = await Promise.all([
-        txQuery(`SELECT id FROM departments WHERE id = $1`, [departmentId]),
-        txQuery<any>(`SELECT * FROM materials WHERE id = $1`, [materialId]),
+      const [deptRes, whRes, matRes] = await Promise.all([
+        txQuery<any>(`SELECT id, dept_code, status FROM departments WHERE id = $1`, [departmentId]),
+        txQuery<any>(`SELECT * FROM warehouses WHERE id = $1`, [warehouseId]),
+        txQuery<any>(
+          `SELECT m.*, mc.category_type
+           FROM materials m
+           JOIN material_categories mc ON m.category_id = mc.id
+           WHERE m.id = $1`,
+          [materialId]
+        ),
       ]);
       if (deptRes.rowCount === 0) throw notFound(`Department #${departmentId} not found`);
+      if (deptRes.rows[0].status !== 'active') {
+        throw badRequest(`Department ${deptRes.rows[0].dept_code} is inactive`, 'INACTIVE_DEPARTMENT');
+      }
+      if (whRes.rowCount === 0) throw notFound(`Warehouse #${warehouseId} not found`);
       if (matRes.rowCount === 0) throw notFound(`Material #${materialId} not found`);
+
+      if (lineId !== null) {
+        const lineRes = await txQuery<any>(`SELECT id, department_id FROM production_lines WHERE id = $1`, [lineId]);
+        if (lineRes.rowCount === 0) throw notFound(`Production line #${lineId} not found`);
+        if (lineRes.rows[0].department_id !== null && lineRes.rows[0].department_id !== departmentId) {
+          throw badRequest(
+            `Production line #${lineId} does not belong to Department #${departmentId}`,
+            'RETURN_LINE_DEPARTMENT_MISMATCH'
+          );
+        }
+      }
+
+      const wh = whRes.rows[0];
+      const mat = matRes.rows[0];
+      if (wh.status !== 'active') {
+        throw badRequest(`Warehouse ${wh.warehouse_code} is inactive and cannot accept returns`, 'INACTIVE_WAREHOUSE');
+      }
+      if (mat.status !== 'active') {
+        throw badRequest(`Material ${mat.sku} is inactive and cannot be selected for returns`, 'INACTIVE_MATERIAL');
+      }
+      if (!isCategoryCompatibleWithWarehouse(wh.warehouse_type, mat.category_type)) {
+        throw badRequest(
+          `Material ${mat.sku} (${mat.category_type}) is incompatible with Warehouse ${wh.warehouse_code} (${wh.warehouse_type})`,
+          'INCOMPATIBLE_WAREHOUSE_MATERIAL'
+        );
+      }
+
+      if ((mat.is_lot_tracked || mat.is_roll_tracked) && lotId === null) {
+        throw badRequest(
+          `Material ${mat.sku} is lot/roll tracked and requires lot_id when posting a return`,
+          'LOT_REQUIRED'
+        );
+      }
+
+      if (lotId !== null) {
+        const lotRes = await txQuery<any>(`SELECT id, material_id FROM inventory_lots WHERE id = $1`, [lotId]);
+        if (lotRes.rowCount === 0) throw notFound(`Lot #${lotId} not found`);
+        if (lotRes.rows[0].material_id !== materialId) {
+          throw badRequest(`Lot #${lotId} does not belong to Material ${mat.sku}`, 'LOT_MATERIAL_MISMATCH');
+        }
+
+        if (stockIssueId === null && wh.warehouse_type !== 'QUARANTINE' && wh.warehouse_type !== 'GENERAL') {
+          const [anyBalRes, anyMvRes, whBalRes, whMvRes] = await Promise.all([
+            txQuery<{ cnt: string }>(`SELECT count(*) as cnt FROM inventory_balances WHERE ${sqlEqInt('lot_id', '$1')}`, [lotId]),
+            txQuery<{ cnt: string }>(`SELECT count(*) as cnt FROM stock_movements WHERE ${sqlEqInt('lot_id', '$1')}`, [lotId]),
+            txQuery<{ cnt: string }>(
+              `SELECT count(*) as cnt FROM inventory_balances WHERE ${sqlEqInt('lot_id', '$1')} AND ${sqlEqInt('warehouse_id', '$2')}`,
+              [lotId, warehouseId]
+            ),
+            txQuery<{ cnt: string }>(
+              `SELECT count(*) as cnt FROM stock_movements WHERE ${sqlEqInt('lot_id', '$1')} AND ${sqlEqInt('warehouse_id', '$2')}`,
+              [lotId, warehouseId]
+            ),
+          ]);
+          const hasAnyHistory =
+            parseInt(String(anyBalRes.rows[0]?.cnt || '0'), 10) > 0 ||
+            parseInt(String(anyMvRes.rows[0]?.cnt || '0'), 10) > 0;
+          const hasWarehouseHistory =
+            parseInt(String(whBalRes.rows[0]?.cnt || '0'), 10) > 0 ||
+            parseInt(String(whMvRes.rows[0]?.cnt || '0'), 10) > 0;
+          if (hasAnyHistory && !hasWarehouseHistory) {
+            throw badRequest(
+              `Lot #${lotId} has no inventory or movement history in Warehouse ${wh.warehouse_code}`,
+              'RETURN_LOT_WAREHOUSE_MISMATCH'
+            );
+          }
+        }
+      }
 
       const { location } = await InventoryEngineService.resolveLocationForWarehouse(
         txQuery,
@@ -962,21 +1052,55 @@ export class WarehouseOutboundService {
       if (stockIssueId !== null) {
         const issRes = await txQuery<any>(`SELECT * FROM stock_issues WHERE id = $1`, [stockIssueId]);
         if (issRes.rowCount === 0) throw notFound(`Stock Issue #${stockIssueId} not found`);
+        const iss = issRes.rows[0];
+        if (iss.status !== 'POSTED') {
+          throw badRequest(`Stock Issue #${stockIssueId} is in status "${iss.status}" and cannot accept returns`);
+        }
+        if (iss.department_id !== departmentId) {
+          throw badRequest(
+            `Department mismatch: Stock Issue #${stockIssueId} belongs to Department #${iss.department_id}, not Department #${departmentId}`,
+            'RETURN_DEPARTMENT_MISMATCH'
+          );
+        }
+        if (iss.production_line_id !== null && lineId !== null && iss.production_line_id !== lineId) {
+          throw badRequest(
+            `Production line mismatch: Stock Issue #${stockIssueId} belongs to Line #${iss.production_line_id}, not Line #${lineId}`,
+            'RETURN_LINE_ISSUE_MISMATCH'
+          );
+        }
+        if (iss.warehouse_id !== warehouseId && wh.warehouse_type !== 'QUARANTINE' && wh.warehouse_type !== 'GENERAL') {
+          throw badRequest(
+            `Warehouse mismatch: Stock Issue #${stockIssueId} was issued from Warehouse #${iss.warehouse_id}, not Warehouse #${warehouseId}`,
+            'RETURN_WAREHOUSE_MISMATCH'
+          );
+        }
 
         const issItemsRes = await txQuery<any>(
           `SELECT * FROM stock_issue_items WHERE issue_id = $1 AND material_id = $2`,
           [stockIssueId, materialId]
         );
         if (issItemsRes.rowCount === 0) {
-          throw badRequest(`Material #${materialId} was not issued on Stock Issue #${stockIssueId}`);
+          throw badRequest(`Material ${mat.sku} was not issued on Stock Issue #${stockIssueId}`, 'RETURN_MATERIAL_MISMATCH');
         }
 
-        const totalIssuedQty = issItemsRes.rows.reduce((s, r) => s + Number(r.issued_qty), 0);
+        const matchedLotItems =
+          lotId !== null ? issItemsRes.rows.filter((r) => r.lot_id === lotId) : issItemsRes.rows;
+        if (lotId !== null && matchedLotItems.length === 0) {
+          throw badRequest(`Lot #${lotId} of ${mat.sku} was not issued on Stock Issue #${stockIssueId}`, 'RETURN_LOT_MISMATCH');
+        }
+
+        const totalIssuedQty = matchedLotItems.reduce((s, r) => s + Number(r.issued_qty), 0);
+        const prevRetSql =
+          lotId !== null
+            ? `SELECT COALESCE(SUM(returned_qty), 0) as sum_ret
+               FROM material_returns
+               WHERE stock_issue_id = $1 AND material_id = $2 AND lot_id = $3 AND status = 'POSTED'`
+            : `SELECT COALESCE(SUM(returned_qty), 0) as sum_ret
+               FROM material_returns
+               WHERE stock_issue_id = $1 AND material_id = $2 AND status = 'POSTED'`;
         const prevRetRes = await txQuery<{ sum_ret: string }>(
-          `SELECT COALESCE(SUM(returned_qty), 0) as sum_ret
-           FROM material_returns
-           WHERE stock_issue_id = $1 AND material_id = $2 AND status = 'POSTED'`,
-          [stockIssueId, materialId]
+          prevRetSql,
+          lotId !== null ? [stockIssueId, materialId, lotId] : [stockIssueId, materialId]
         );
         const alreadyReturned = roundQty(Number(prevRetRes.rows[0]?.sum_ret || 0));
         if (roundQty(alreadyReturned + returnedQty) > roundQty(totalIssuedQty)) {
@@ -986,7 +1110,7 @@ export class WarehouseOutboundService {
           );
         }
 
-        unitCost = roundQty(Number(issItemsRes.rows[0].unit_cost));
+        unitCost = roundQty(Number(matchedLotItems[0].unit_cost));
       }
 
       const returnNumber = generateDocRef('RET');
