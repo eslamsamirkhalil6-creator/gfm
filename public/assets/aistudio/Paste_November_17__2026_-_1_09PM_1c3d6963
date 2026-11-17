@@ -1,0 +1,663 @@
+تمام. سنكتب المستند هنا مباشرةً كرسالة نصية منظمة بصيغة Markdown، بدل إنشاء ملف. يمكنك نسخه لاحقًا إلى Google Build أو حفظه كملف `.md`.
+
+سأحافظ على القرارات المعتمدة، وأفصل بين ما تم اعتماده وما لا يزال مفتوحًا، ولن أعتبر Gate A مغلقًا أو أسمح بتنفيذ HR.
+
+# **GFMSv0.3 – HR GATE A FINAL ADDENDUM v1.1 CANDIDATE**
+
+
+
+DRAFT – FOR SYSTEM OWNER REVIEW
+
+GATE A OPEN
+
+
+
+**System:** Garment Factory Management System (GFMSv0.3)\
+**Document:** HR Gate A Final Addendum\
+**Version:** 1.1 Candidate\
+**Purpose:** Consolidate HR architecture decisions, ISS-06 decisions, and cross-cutting security, governance, audit, and recovery principles.
+
+## **1. Executive Summary**
+
+This document consolidates the approved HR architecture decisions and the six Architecture Review Batches.
+
+The objective is to establish a coherent architecture for the HR module and its cross-cutting approval, audit, security, evidence, and recovery controls before implementation.
+
+This document does not authorize implementation.
+
+The following boundaries remain mandatory:
+
+- Gate A must be formally approved before HR implementation.
+- Gate B requires live PostgreSQL 14+ verification.
+- OP-01 operational readiness is independent of Gate A.
+- No HR migrations, seeds, SQL, backend code, frontend code, or roadmap changes are authorized by this document alone.
+
+**Important source limitation:** The 171 ISS-06 decisions and six batches are reconstructed here from the owner-approved decisions available in the conversation. The original Addendum v1.0 and detailed architecture v0.6 have not been independently re-read in this conversation. Therefore, this is a candidate consolidation, not a claim of exact line-by-line reconciliation with those artifacts.
+
+## **2. Current Architecture Baseline**
+
+The existing repository audit reported:
+
+- Six existing migrations, numbered 001–006.
+- Seven existing seed files, numbered 001–007.
+- Twelve canonical roles and 48 permissions.
+- No HR-specific roles, permissions, migrations, seeds, routes, or frontend components implemented.
+- `DEP-HR` exists, but its `manager_id` is currently NULL.
+- `department_employees.user_id` is NOT NULL and cannot represent non-login shop-floor operators.
+- Existing `users.full_name` contains operational titles and must not automatically synchronize with HR employee profiles.
+- `UserService` defaults omitted role IDs to Department User.
+- `AuditService` appends records to `audit_logs`; audit reads require `audit:read`.
+- Existing PostgreSQL trigger behavior has not been verified against live PostgreSQL 14+.
+- `pg-mem` test results do not constitute PostgreSQL compatibility certification.
+
+These are reported audit findings, not newly performed repository verification.
+
+## **3. Approved Owner Decisions U-01 through U-07**
+
+### **U-01 – Owner Executive Access**
+
+Approved Option A:
+
+- Owner Executive receives `dashboard:view`.
+- Owner Executive does not receive `dashboard:factory`.
+- Compensation visibility is limited to aggregate summaries.
+- No individual salary visibility.
+- Executive-subject salary revisions remain dormant and outside Phase 08A.
+
+### **U-02 – Executive Compensation Permission**
+
+Approved Option A:
+
+- Do not create `hr:confidential:compensation:initiate_executive` in Seed 008.
+- Future executive salary governance requires separate design and owner approval.
+
+### **U-03 – Employee Self-Service Role**
+
+Approved Option B:
+
+- Use existing Department User as a secondary role during HR onboarding.
+- Preserve the employee's operational role.
+- Do not grant `hr:self:*` directly to operational roles.
+- Every self-service endpoint must verify authenticated identity, matching `hr_employees.user_id`, row ownership, and termination-pending restrictions.
+
+### **U-04 – Governance Fallback Cancellation**
+
+Approved Option B:
+
+- Cancellation requires both SLA expiry and verified absence of any eligible active approver or active delegate.
+- HR Manager is the primary actor.
+- Factory Manager is an exceptional governance actor.
+- Requester and System Administrator are excluded.
+- Eligibility verification and cancellation must execute atomically and be immutably audited.
+
+### **U-05 – System Administrator Self-Service**
+
+Approved Option A:
+
+- System Administrator receives no `hr:self:*` permissions.
+- If the administrator is also an employee, Department User may be assigned as a secondary role through HR onboarding.
+- Technical administration and HR access remain separate.
+
+### **U-06 – Endpoint Permission Corrections**
+
+Approved Option A:
+
+1. Asset Custody endpoint #35: add `hr:self:view` where applicable, with ownership verification.
+2. Contracts endpoint #19: add `hr:self:view` where applicable, with ownership verification.
+3. Endpoints #25 and #30: replace generic `hr:self` shorthand with granular permissions.
+4. Termination initiation endpoint #5a: restrict Factory Manager initiation to termination of an HR Manager subject under Policy #8.
+
+### **U-07 – Roadmap Status**
+
+Approved Option A:
+
+After Gate A approval:
+
+- Phase 07 is recorded as completed according to existing pg-mem evidence only.
+- Phase 08A is recorded as planned, not implemented.
+- Live PostgreSQL Gate B remains mandatory before HR DDL, migrations, and seeds.
+
+No roadmap edit is currently authorized.
+
+# **4. ISS-06 – Approval, SLA, Audit, Evidence, and Recovery Architecture**
+
+The following sections consolidate the 171 approved decisions into their architectural groups. The original individual decision numbers should remain preserved in the decision ledger during formal reconciliation.
+
+## **4.1 Approval SLA and Business Calendar**
+
+Approved principles:
+
+1. SLA is calculated and snapshotted when an approval step is created.
+2. Later SLA configuration changes affect new steps only.
+3. SLA is measured in approved business hours, not calendar hours.
+4. A centralized, versioned factory calendar governs working days, hours, breaks, and official holidays.
+5. Every approval step retains its calendar version.
+6. Changes to calendars do not recalculate existing deadlines.
+7. Active PENDING approval steps must have a valid deadline.
+8. Missing or invalid policy-specific SLA configuration prevents creation of a new approval cycle or step.
+9. SLA values must be positive decimal business hours.
+10. Precision is limited to two decimal places.
+11. Conversion to seconds must be exact, without silent rounding.
+12. Each policy has its own explicit minimum and maximum SLA bounds.
+13. System Administrator exclusively manages SLA configuration.
+14. HR Manager has read-only access to SLA configuration.
+15. SLA configuration versions are immutable once published.
+16. New versions activate at scheduled effective timestamps.
+17. Overlapping versions are prohibited.
+18. Withdrawal is forward-only and requires a valid replacement configuration.
+19. Existing approval steps retain their original SLA snapshots.
+
+**Still unresolved:**
+
+- Actual factory IANA timezone.
+- Working days and hours.
+- Break schedules and official holidays.
+- Numeric SLA minimum and maximum values.
+- Exact SLA configuration keys in `hr_settings`.
+- HR Manager conflict fallback for SLA extension.
+
+## **4.2 SLA Extensions**
+
+Approved principles:
+
+- An extension requires a formal action.
+- Mandatory reason and audit evidence.
+- Exactly one extension per approval step.
+- Extension is permitted only before the original deadline.
+- Maximum extension duration cannot exceed the original SLA duration.
+- Extension duration is measured in business hours.
+- The HR Manager is the primary extension authority.
+- HR Manager cannot authorize an extension involving their own request, themselves as subject, or their own approval step.
+- System Administrator receives no extension authority from technical administration privileges.
+- The extension action does not require a second approver in the ordinary non-conflicted case.
+
+**Unresolved blocking item:** No approved fallback authority has been established when the HR Manager is conflicted or unavailable. Factory Manager must not be assumed to have this authority.
+
+## **4.3 Governance Fallback Cancellation**
+
+Approved principles:
+
+- SLA expiry alone is insufficient.
+- The system must verify that no eligible active approver or delegate exists.
+- Eligibility must be rechecked immediately before cancellation.
+- The eligibility check and cancellation must be atomic.
+- Concurrency protection must cover the approval step and eligibility-affecting data.
+- Retry is bounded and rechecks eligibility each time.
+- If retries fail, cancellation does not occur.
+- Operational review is required.
+- HR Manager is the primary actor.
+- Factory Manager is permitted only under objectively verifiable HR Manager ineligibility.
+- Delegates cannot execute Governance Fallback Cancellation.
+- System Administrator and requester are excluded.
+- If neither HR Manager nor Factory Manager is eligible, the request remains pending and is escalated for operational resolution.
+
+Factory Manager exceptional eligibility requires documented evidence of an objective HR Manager conflict or objective account, employment, appointment, or authorization failure. Mere delay or non-response is insufficient.
+
+## **4.4 Approval Expiry and Late Decisions**
+
+Approved principles:
+
+- An expired approval step remains persisted as `PENDING`.
+- Overdue status is derived from the current time and the stored deadline.
+- Expiry triggers escalation, not automatic revocation of approval authority.
+- Eligible approvers retain approve/reject authority after expiry.
+- Late decisions are processed normally.
+- Late decisions must be marked and audited.
+- Decision timestamp and business-time lateness must be recorded.
+- A successful decision immediately stops future escalation tasks and notifications.
+- Reassignment does not reset the original deadline.
+- Reassignment does not erase overdue status.
+- Only HR Manager may reassign, subject to conflict-of-interest checks.
+- Reassignment targets must pass full live eligibility validation.
+- If no eligible target exists, reassignment fails closed and the request remains pending.
+- Repeated reassignment is allowed with complete immutable audit.
+
+## **4.5 Reassignment and Notifications**
+
+Approved principles:
+
+- Record previous and new approver, actor, reason, and timestamp.
+- Revoke previous approver's access immediately.
+- Notify the previous approver that access has been revoked.
+- Notify the new approver with the original deadline and overdue status.
+- Notify HR Manager of successful reassignment.
+- Notifications use transactional outbox.
+- Reassignment and outbox record creation occur in one transaction.
+- Notification failure does not reverse a valid reassignment.
+- Retry uses exponential backoff with configurable limits.
+- Exhausted retries move messages to Dead Letter.
+- System Administrator may manually replay Dead Letter notifications after the cause is fixed.
+- Manual replay is audited and does not grant HR content or approval rights.
+- Delivery success means provider/channel acceptance, not proof that a person read the message.
+
+## **4.6 Escalation**
+
+Approved principles:
+
+- Escalation occurs immediately at SLA expiry.
+- Current eligible approver and HR Manager are baseline recipients.
+- Additional recipients depend on policy-specific escalation rules.
+- Factory Manager is included only under explicit policy conditions.
+- Escalation does not grant approval, reassignment, cancellation, or data-access rights.
+- Recurring reminders use configurable policy-specific intervals and attempt limits.
+- Notification content contains minimal metadata and a secure context link.
+- No employee names, salary, contracts, or sensitive reasons are included in ordinary escalation notifications.
+- No mandatory acknowledgement is required.
+- Acknowledgement does not change SLA or approval authority.
+- Any valid terminal request state closes future escalation tasks.
+- Reopening creates a new approval cycle with a new SLA snapshot.
+- Previous cycles, deadlines, decisions, and audit records remain immutable.
+
+## **4.7 Reopening Approval Cycles**
+
+Approved principles:
+
+- HR Manager controls reopening.
+- Reopening requires a mandatory reason.
+- Request type and policy must permit reopening.
+- HR Manager must pass conflict-of-interest checks.
+- Factory Manager may act only under documented objective HR Manager ineligibility.
+- Factory Manager must pass full live eligibility validation.
+- If both are ineligible, reopening is denied and the request remains in its prior terminal state.
+- Every reopening creates a new cycle linked to the prior cycle.
+- Each new cycle receives the currently effective policy, SLA, and calendar snapshots.
+- Policy versions are immutable per cycle.
+- Retired policies apply only to new-cycle restrictions; existing cycles continue under their original policy snapshots.
+- Replacement policies are forward-only.
+- Reopening is unlimited only where policy permits and every reopening passes full governance.
+- Anomaly detection alerts on repeated reopenings but does not automatically block a valid reopening.
+- A reopened cycle cannot be directly cancelled outside the normal authorized workflow.
+- Creation, audit, and notification outbox operations occur atomically.
+- Idempotency and database uniqueness prevent duplicate cycles.
+- Concurrent reopening attempts are protected by row-level locks and state revalidation.
+
+## **4.8 Policy Versioning**
+
+Approved principles:
+
+- Every approval cycle retains its immutable policy version.
+- Policy retirement prevents new cycles under that version.
+- Existing cycles continue under their original version.
+- Replacement policy activation is forward-only.
+- Policy resolution happens when a cycle is created.
+- If no valid mapped policy is available, cycle creation fails closed and triggers an operational alert.
+- No silent policy migration is permitted.
+
+# **5. Batch 1 – Clock Integrity & Time Trust**
+
+OWNER APPROVED
+
+Approved architecture:
+
+1. Factory Local Time remains the operational display and reference.
+2. Every time-sensitive timestamp retains sufficient IANA timezone and offset information.
+3. Every timestamp also retains a resolved absolute instant for deterministic comparisons.
+4. The Central Event Sequence provides durable ordering when clock trust is lost.
+5. Existing deadlines are not recalculated when timezone database rules change.
+6. NTP trust and clock drift thresholds are configurable and versioned.
+7. Time-sensitive operations must not proceed when trusted time cannot be established.
+8. The central server clock is authoritative for approval deadlines, escalation, and time-sensitive HR decisions.
+9. Clock drift beyond the approved threshold blocks affected time-sensitive operations.
+10. NTP synchronization loss is governed by a bounded offline trust window.
+11. Recovery requires validation of synchronization, drift, and stability.
+12. Untrusted observations must never be retrospectively relabeled as trusted.
+13. During clock failure, record an untrusted local observation and unique event identity.
+14. After recovery, append separate trusted recovery evidence.
+15. Durable event sequence must survive restarts and must not reset.
+16. If trusted event persistence fails, the sensitive operation must be rejected.
+
+**Technical design details deferred:** exact timezone, clock thresholds, NTP trust window, monitoring cadence, clock correction method, and complete time-sensitive operation inventory.
+
+# **6. Batch 2 – Emergency Journal & Cryptographic Recovery**
+
+OWNER APPROVED
+
+Approved architecture:
+
+1. An independent durable event sequence must exist outside the primary PostgreSQL database.
+2. Events must be durably appended before being treated as persisted.
+3. Emergency Journal integrity uses append-only storage and cryptographic integrity protection.
+4. Hash chaining or an equivalent mechanism detects modification, deletion, and reordering.
+5. Cryptographic keys are protected and isolated from application code and plain configuration.
+6. Minimal sensitive payload is stored in the Emergency Journal.
+7. References are preferred over unnecessary full HR data copies.
+8. Windows OS-protected key mechanisms, such as DPAPI or Windows Certificate Store, may be used after detailed design.
+9. A dedicated least-privilege service identity controls journal access.
+10. System Administrator technical privileges do not automatically grant journal-content access.
+11. Key versions are tracked.
+12. Rotation is forward-only; historical events are not rewritten or re-signed.
+13. Key compromise triggers immediate containment and forensic preservation.
+14. Retired verification keys remain protected while associated evidence must be retained.
+15. Key backup is encrypted and stored offline, separately from the primary server.
+16. Recovery requires two independent authorized persons.
+17. Recovery exercises are conducted quarterly in an isolated environment.
+18. Recovery failure creates a Critical Security/Recovery Incident.
+19. Journal read access is restricted to authorized independent audit/security custodians.
+20. Export requires scope limitation, redaction, encryption, independent audit, and chain-of-custody evidence.
+21. Failure of both primary persistence and Emergency Journal persistence means sensitive operations must fail closed.
+22. The system must never claim that audit evidence was persisted if durable persistence failed.
+
+**Technical design details deferred:** journal format, file-system durability protocol, disk-full behavior, locking, hash/signature algorithms, key storage implementation, rotation triggers, recovery identities, and detailed retention rules.
+
+# **7. Batch 3 – Evidence Repository & Destruction Registry**
+
+OWNER APPROVED
+
+Approved architecture:
+
+1. Evidence content and destruction records are separate.
+2. Evidence lifecycle is immutable and event-based.
+3. Destruction Registry is persistent and cryptographically protected.
+4. Registry storage and recovery must be independent of Evidence Repository backups.
+5. Destruction requires just-in-time validation of all applicable Legal Holds, Incidents, and Preservation Orders.
+6. Validation and destruction must be atomic and protected against concurrent changes.
+7. Destruction applies to primary copies, replicas, and backups.
+8. Copies awaiting backup-lifecycle expiry remain inaccessible in quarantine.
+9. Disaster recovery restores the Registry before the Evidence Repository becomes accessible.
+10. Previously approved destruction decisions must be reapplied before repository release.
+11. Registry recovery requires independent Audit and Security Custodian approval.
+12. Registry corruption, missing sequence entries, or conflicting copies block destruction.
+13. Conflicting copies are quarantined and independently reconciled.
+14. No event may be silently deleted or inferred.
+15. Material residual uncertainty must be documented.
+16. Destruction resumes only after independent evidence-based acceptance.
+17. Expired residual-risk acceptance automatically suspends affected destruction until reassessment and new approval.
+
+**Important scope boundary:** The existence of this architecture does not authorize implementing binary evidence storage or external purge operations during Phase 08A.
+
+# **8. Batch 4 – Governance & Custodian Independence**
+
+OWNER APPROVED
+
+Approved architecture:
+
+1. Governance and custodianship must be structurally independent of unilateral System Administrator and Factory Manager control.
+2. Audit, Security, and Governance responsibilities must remain separated.
+3. Sensitive actions require live eligibility and conflict-of-interest checks.
+4. Primary and alternate custodians must be appointed in advance.
+5. Dual-person controls remain mandatory.
+6. One person cannot fill both independent approval functions.
+7. Loss of eligibility or material conflict triggers suspension of the affected authority.
+8. Appointment, suspension, removal, and permission changes require immutable independent records.
+9. Governance authority must operate under a formal charter.
+10. The charter must define membership, terms, eligibility, conflict rules, quorum, voting, and accountability.
+11. Decisions require the approved quorum and majority rules.
+12. Members with conflicts are excluded from the relevant decision.
+13. No governance decision may proceed without quorum.
+14. Vacancies are handled using pre-approved eligible alternates.
+15. No emergency quorum bypass is allowed.
+16. Governance records are cryptographically verifiable and append-only.
+17. Access to full governance records is restricted.
+18. Factory Manager receives operationally necessary summaries only.
+19. System Administrator has no automatic sensitive governance-record access.
+20. Exceptional access requires independent purpose-limited authorization.
+21. Emergency requests do not bypass governance quorum.
+
+**Details deferred:** exact membership, appointing authority implementation, quorum thresholds, alternate identities, review cadence, and detailed access/retention procedures.
+
+# **9. Batch 5 – Legal Disclosure & Incident Management**
+
+OWNER APPROVED
+
+Approved architecture:
+
+1. Legal authority, jurisdiction, and disclosure scope must be validated before access or disclosure.
+2. Disclosure must be limited to the minimum legally necessary material.
+3. Originals must remain preserved.
+4. Independent legal review and Audit Custodian evidence verification are required.
+5. A second independent authorized person verifies scope, recipients, and release.
+6. Recipient identity, legal capacity, and official secure channel must be verified immediately before delivery.
+7. Every material scope change requires fresh authorization and review.
+8. Final packages use immutable manifests and cryptographic hashes.
+9. Delivery status must distinguish prepared, transmitting, partially delivered, delivered, failed, and unknown.
+10. Ambiguous transmission must not trigger an uncontrolled resend.
+11. Receipt evidence must distinguish transport acceptance from verified human acknowledgement.
+12. Post-delivery handling conditions must be documented where legally permissible.
+13. Onward-disclosure notification may be requested where lawful.
+14. Closure requires documented confirmation or an explicit unresolved closure status.
+15. Legal disclosure, Security Incident, and Evidence Lifecycle remain distinct but linked workflows.
+16. Security incidents require immediate containment and evidence preservation.
+17. Affected destruction must be suspended.
+18. Release from a security hold requires independent dual approval.
+19. Incident closure requires investigation, root-cause analysis, remediation, and independent review.
+20. Material new evidence can reopen a previously closed incident.
+21. Employee and regulatory notification decisions require independent legal assessment.
+22. Legal Holds and Preservation Orders remain controlling until independently released.
+23. Invalid or unauthorized legal requests are rejected and documented.
+24. Third-party employee data is redacted unless disclosure is independently justified.
+25. Redaction is verified through automated checks and independent human review.
+26. Unauthorized disclosure creates a Critical Security Incident.
+27. Disclosure during an open Security Incident requires independent legal exception review and dual control.
+28. Legal disclosure execution must preserve a complete chain of custody.
+
+**Details deferred:** jurisdiction-specific legal procedures, reviewer identities, recipient verification mechanisms, approved transfer channels, retention schedules, and legal notification deadlines.
+
+# **10. Batch 6 – Residual Risk & Recovery Controls**
+
+OWNER APPROVED
+
+The System Owner approved all five architectural principles.
+
+### **10.1 Unified Fail-Closed Policy**
+
+Any failure that prevents proof of integrity, authorization, eligibility, or decision validity blocks the affected sensitive operation.
+
+The system must not:
+
+- Guess missing authorization.
+- Treat unavailable evidence as valid.
+- Bypass required dual control.
+- Assume a failed verification succeeded.
+- Continue a sensitive operation based on stale eligibility information.
+
+### **10.2 Scoped Suspension**
+
+Suspension must be limited to the affected sensitive operations whenever independent safe workflows remain demonstrably valid.
+
+Examples:
+
+- Emergency Journal failure blocks sensitive operations requiring trusted audit persistence.
+- Destruction Registry failure blocks evidence destruction.
+- Disclosure incidents block affected records, packages, recipients, or channels.
+- Unaffected factory workflows may continue only where their integrity and independence are established.
+
+This does not authorize a broad factory shutdown without a demonstrated reason.
+
+### **10.3 Recovery Is More Than Restoring Files**
+
+Database or file restoration alone is insufficient.
+
+Recovery must verify:
+
+- Cryptographic keys and their validity.
+- Emergency Journal integrity.
+- Durable event sequence completeness.
+- Destruction Registry integrity and ordering.
+- Reapplication of approved destruction decisions.
+- Legal Holds and Preservation Orders.
+- Evidence Repository quarantine.
+- Independent Audit and Security Custodian approvals.
+
+### **10.4 Residual Risk Governance**
+
+Every accepted residual risk must have:
+
+- Unique identity.
+- Classification.
+- Scope and affected operations.
+- Risk owner.
+- Compensating controls.
+- Review date.
+- Supporting evidence.
+- Required independent approvals.
+- Current state.
+
+Permitted states:
+
+- Accepted
+- Under Review
+- Expired
+- Suspended
+- Rejected
+
+Expiry automatically suspends affected operations until reassessment and new approval.
+
+### **10.5 Operational Readiness Gate**
+
+Before production HR activation:
+
+- Appoint primary and alternate custodians.
+- Validate role and permission separation.
+- Test key recovery and backups.
+- Test Emergency Journal recovery.
+- Test Registry recovery and destruction enforcement.
+- Document operating procedures.
+- Complete live PostgreSQL 14+ verification.
+- Obtain applicable independent security and legal review.
+
+These readiness requirements do not replace Gate A or Gate B.
+
+# **11. ISS-02 – Approval Context Endpoint**
+
+The following owner-approved security contract must be preserved for endpoint #41b:
+
+- Dedicated endpoint: `GET /api/approvals/:id/context`.
+- Dedicated DTO for each applicable policy.
+- Explicit field allowlists.
+- Free-text `reason`, `notes`, and `decision_notes` excluded.
+- Role-pooled unassigned steps remain inaccessible.
+- Expired steps remain accessible to the current eligible approver and valid delegate.
+- GET must not change workflow state.
+- Reassignment immediately revokes previous approver access.
+- Delegation must be revalidated on every request.
+- Audit event must be recorded before returning data.
+- Audit failure means fail closed.
+- Nonexistent and unauthorized requests return a unified 404.
+- Invalid ID syntax returns 400.
+- Unauthenticated requests return 401.
+- No self-approval.
+- Requester and subject exclusions remain enforced.
+- System Administrator is excluded from non-system HR approvals.
+- Audit records must not store DTO payloads or employee PII.
+
+**Still open:** Concrete field names, data types, nullability, and complete DTO definitions for the relevant policies.
+
+# **12. ISS-07 – HR Onboarding and Self-Service**
+
+Approved baseline:
+
+- HR Manager may create or link a baseline HR employee profile with explicit audit marking.
+- Baseline profile creation does not grant approval authority.
+- Existing operational roles remain preserved.
+- Department User may be assigned as a secondary role through HR onboarding.
+- System Administrator does not receive automatic HR self-service permissions.
+
+**Still open:**
+
+1. Post-bootstrap career-field self-edit lock.
+2. Explicit System Administrator `users:roles` handoff for secondary Department User assignment during onboarding.
+3. Confirmation of exact endpoint and field behavior.
+
+# **13. NUANCE-C – Self-Service Permission Parity**
+
+Endpoint #24 must replace generic `hr:self` with the granular permission:
+
+`hr:self:attendance:view`
+
+This correction must be reflected consistently in the endpoint contract and permission matrix.
+
+# **14. Remaining Gate A Owner Confirmations**
+
+The following remain open and must not be silently resolved.
+
+| Item                | Required resolution                                                          |
+| ------------------- | ---------------------------------------------------------------------------- |
+| ISS-02 #41b         | Concrete DTO fields, types, nullability                                      |
+| ISS-06 / NUANCE-A   | `due_at NOT NULL` for active PENDING steps and exact SLA keys                |
+| ISS-06              | HR Manager conflict fallback for SLA extension                               |
+| ISS-07 / NUANCE-B   | Career-field self-edit lock and onboarding role handoff                      |
+| NUANCE-C            | Confirm #24 granular permission parity                                       |
+| Formal ratification | HR-DEC-01–HR-DEC-14, OD-01–OD-03, U-01–U-07, §11.2 #2–#5, and final Addendum |
+
+The 171 ISS-06 decisions and six batches are owner-approved in the conversation, but must be incorporated into the controlled architecture artifact and reconciled with the original design before Gate A can close.
+
+# **15. Gate B – PostgreSQL 14+ Verification**
+
+NOT VERIFIED
+
+Live PostgreSQL 14+ verification remains mandatory.
+
+The reported verification scope includes:
+
+- DDL and migration compatibility.
+- Trigger and PL/pgSQL behavior.
+- `GENERATED ALWAYS` behavior.
+- Concurrent `FOR UPDATE` behavior.
+- Two-phase idempotency.
+- SQLSTATE mapping.
+- `warehouse_notifications` hygiene.
+- Existing 89/89 tests and relevant end-to-end tests.
+
+`pg-mem` cannot substitute for live PostgreSQL verification.
+
+No HR DDL, migrations, or seeds may be authorized before the required Gate B checks pass.
+
+# **16. OP-01 – Operational Readiness**
+
+PENDING
+
+OP-01 remains separate from Gate A.
+
+It includes:
+
+- HR Manager appointment and account provisioning.
+- HR Officer appointment and account provisioning.
+- Owner Executive appointment and account provisioning.
+- Secondary Department User role assignments.
+- Legal HR onboarding of `admin`.
+- DEP-HR manager designation.
+- Production cryptographic key custody.
+- Leave balance initialization.
+- Custodian and alternate appointment.
+- Recovery procedures and operational training.
+
+# **17. Final Status**
+
+**Gate A – Architecture**
+
+OPEN
+
+Owner decisions and six batches are approved, but the controlled specification still needs reconciliation and formal ratification.
+
+**Gate B – PostgreSQL**
+
+PENDING
+
+Live PostgreSQL 14+ verification has not been demonstrated.
+
+**OP-01 – Operations**
+
+PENDING
+
+Staffing, appointments, custody, and production readiness remain outstanding.
+
+**HR Implementation**
+
+NOT AUTHORIZED
+
+No implementation authorization is implied by this candidate document.
+
+## **18. Required Next Action**
+
+The next step is a read-only specification reconciliation by Google Build:
+
+1. Compare this candidate against Addendum v1.0 and detailed architecture v0.6.
+2. Preserve every approved owner decision.
+3. Verify that the 171 ISS-06 decisions are represented without omission or contradiction.
+4. Keep unresolved items explicitly marked OPEN.
+5. Produce a revised candidate Addendum v1.1.
+6. Do not modify repository files, roadmap, code, SQL, migrations, or seeds.
+7. Do not start HR implementation.
+8. Return a reconciliation report identifying every addition, correction, and unresolved issue.
+
+**Final architectural conclusion:** The six batches are approved as architectural principles. The document is a candidate consolidation for controlled review, not final Gate A approval.
